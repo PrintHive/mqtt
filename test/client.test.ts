@@ -374,7 +374,7 @@ describe("connect", () => {
       const flooded = yield* Deferred.make<net.Socket>()
       const pingreq = encode(P.pingreq)
 
-      const port = yield* scripted((packet, socket) => {
+      const { port } = yield* scripted((packet, socket) => {
         if (Buffer.compare(encode(packet), pingreq) === 0) return void socket.write(encode(P.pingresp))
 
         if (!("subscriptions" in packet)) return
