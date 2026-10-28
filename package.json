@@ -1,0 +1,68 @@
+{
+  "name": "@printhive/mqtt",
+  "version": "0.0.0",
+  "description": "A fast MQTT 3.1.1 client for Effect, on Bun and Node.js",
+  "keywords": [
+    "mqtt",
+    "mqtt-client",
+    "effect",
+    "bun",
+    "iot",
+    "bambu-lab"
+  ],
+  "license": "MIT",
+  "author": "PrintHive",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PrintHive/mqtt.git"
+  },
+  "homepage": "https://github.com/PrintHive/mqtt#readme",
+  "bugs": {
+    "url": "https://github.com/PrintHive/mqtt/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "!dist/**/*.map",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint --deny-warnings",
+    "test": "bun test",
+    "test:node": "vitest run",
+    "bench": "bun bench/run.ts",
+    "check": "bun run lint && bun run typecheck && bun run test",
+    "prepublishOnly": "bun run check && bun run build"
+  },
+  "peerDependencies": {
+    "effect": "4.0.7"
+  },
+  "devDependencies": {
+    "@oxlint/plugins": "1.90.0",
+    "@types/node": "^26",
+    "aedes": "^1.2.0",
+    "mqtt": "^5.16.1",
+    "oxlint": "1.90.0",
+    "typescript": "^7",
+    "vitest": "^5.0.5"
+  }
+}
