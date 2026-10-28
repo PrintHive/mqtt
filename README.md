@@ -76,6 +76,7 @@ The first connection is not retried, so `connect` fails fast when the broker is 
 
 - QoS 0 completes once the packet is written. While the client is reconnecting, or the socket's buffer is full, it waits.
 - QoS 1 completes on PUBACK, and QoS 2 on PUBCOMP. A message whose connection drops is sent again with DUP set after the reconnect.
+- A publish interrupted before its bytes reach a socket is never sent, at any QoS, so it is safe to retry. One interrupted after that still finishes its exchange, as MQTT requires.
 
 ## Slow consumers
 
@@ -111,6 +112,12 @@ Every error is a tagged error, so `Effect.catchTag` can handle each one.
 | `MalformedPacket` | The broker sent bytes that are not valid MQTT 3.1.1. |
 | `ProtocolError` | The broker sent a packet a client must not receive. |
 | `ClientClosed` | The client's scope closed, or reconnecting gave up. |
+
+## Packets, the codec, and tests
+
+`@printhive/mqtt/packet` exports the MQTT 3.1.1 packet types and their constructors. `@printhive/mqtt/codec` exports `encode`, the incremental `Decoder`, and `MalformedPacket`. Tools that record or replay traffic can use them without opening a connection.
+
+Every timer runs on Effect's `Clock`: keep-alive, the connect timeout, and the reconnect schedule. Under `TestClock` from `effect/testing/TestClock`, `TestClock.adjust` drives PINGREQ, the PINGRESP deadline, and reconnect delays without real waiting. Socket I/O still takes real time.
 
 ## Performance
 

@@ -162,6 +162,33 @@ describe("connect", () => {
       })
     ))
 
+  it.each([0, 1] as const)("never sends a QoS %i publish whose caller was interrupted before it was written", (qos) =>
+    run(
+      Effect.gen(function* () {
+        const { port, drop } = yield* aedes()
+        const observer = yield* connect({ host, port })
+        const messages = yield* observer.subscribe("jobs", { qos: 1 })
+        const client = yield* connect({ host, port, reconnect: Schedule.spaced("300 millis") })
+
+        const reconnecting = yield* Effect.forkChild(
+          client.statusChanges.pipe(Stream.filter(ConnectionStatus.$is("Reconnecting")), Stream.take(1), Stream.runDrain),
+          { startImmediately: true }
+        )
+
+        const back = yield* Effect.forkChild(reconnected(client.statusChanges), { startImmediately: true })
+
+        drop(client.clientId)
+        yield* Fiber.join(reconnecting)
+
+        const abandoned = yield* Effect.forkChild(client.publish("jobs", "abandoned", { qos }), { startImmediately: true })
+
+        yield* Fiber.interrupt(abandoned)
+        yield* Fiber.join(back)
+        yield* client.publish("jobs", "after", { qos: 1 })
+        expect((yield* messages.pipe(Stream.take(1), Stream.runCollect)).map(summary)).toEqual([["jobs", "after", 1, false]])
+      })
+    ))
+
   it("sends DISCONNECT on scope close, so the broker does not publish the will", () =>
     run(
       Effect.gen(function* () {

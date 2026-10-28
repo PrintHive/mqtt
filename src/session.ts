@@ -24,6 +24,8 @@ type Stage = "Unacked" | "Released"
 interface InFlight {
   readonly packet: PublishAcknowledged
   stage: Stage
+  /** False until the PUBLISH reaches a socket. A caller interrupted before then gets a promise that nothing is sent. */
+  written: boolean
   readonly done: Deferred.Deferred<void, MqttError>
 }
 
@@ -65,10 +67,17 @@ export class Session {
       const done = Deferred.makeUnsafe<void, MqttError>()
       const packet = P.publishAcknowledged(topic, payload, qos, packetId, retain, false)
 
-      this.inFlight.set(packetId, { packet, stage: "Unacked", done })
+      const f: InFlight = { packet, stage: "Unacked", written: this.link !== undefined, done }
+
+      this.inFlight.set(packetId, f)
       this.link?.write(encode(packet))
 
-      return Deferred.await(done)
+      // Once written, the exchange must finish (section 4.4). Before that, an interrupted caller leaves nothing behind.
+      return Effect.onInterrupt(Deferred.await(done), () =>
+        Effect.sync(() => {
+          if (!f.written && this.inFlight.get(packetId) === f) this.inFlight.delete(packetId)
+        })
+      )
     })
   }
 
@@ -106,7 +115,8 @@ export class Session {
     if (!sessionPresent) this.received.clear()
 
     for (const [id, f] of this.inFlight) {
-      link.write(encode(f.stage === "Released" ? P.pubrel(id) : { ...f.packet, dup: true }))
+      link.write(encode(f.stage === "Released" ? P.pubrel(id) : { ...f.packet, dup: f.written }))
+      f.written = true
     }
 
     for (const r of this.requests.values()) link.write(encode(r.packet))
