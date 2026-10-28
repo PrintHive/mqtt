@@ -1,5 +1,10 @@
 import type { Buffer } from "node:buffer"
+import { execFileSync } from "node:child_process"
+import { mkdtempSync, readFileSync } from "node:fs"
 import * as net from "node:net"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import * as tls from "node:tls"
 import { Aedes } from "aedes"
 import type { AedesOptions, Client } from "aedes"
 import * as Effect from "effect/Effect"
@@ -55,9 +60,9 @@ export const aedes = (options?: AedesOptions) =>
   })
 
 /** A scripted broker that answers the first packet (CONNECT) with CONNACK and hands every later packet to `onPacket`. */
-export const scripted = (onPacket: (packet: Packet, socket: net.Socket) => void) =>
+export const scripted = (onPacket: (packet: Packet, socket: net.Socket) => void, secure?: tls.TlsOptions) =>
   Effect.gen(function* () {
-    const server = net.createServer((socket) => {
+    const handle = (socket: net.Socket) => {
       let connected = false
 
       const decoder = new Decoder((packet) => {
@@ -76,10 +81,21 @@ export const scripted = (onPacket: (packet: Packet, socket: net.Socket) => void)
         }
       })
       socket.on("error", () => socket.destroy())
-    })
+    }
 
-    return yield* listen(server)
+    return yield* listen(secure ? tls.createServer(secure, handle) : net.createServer(handle))
   })
 
 /** A local port with nothing listening on it. */
 export const closedPort = Effect.scoped(listen(net.createServer()))
+
+/** A throwaway self-signed certificate for 127.0.0.1, made with the openssl CLI so no key lives in the repo. */
+export const selfSigned = (): tls.TlsOptions => {
+  const dir = mkdtempSync(join(tmpdir(), "mqtt-tls-"))
+  const key = join(dir, "key.pem")
+  const cert = join(dir, "cert.pem")
+
+  execFileSync("openssl", ["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "1", "-subj", "/CN=127.0.0.1", "-keyout", key, "-out", cert], { stdio: "ignore" })
+
+  return { key: readFileSync(key), cert: readFileSync(cert) }
+}

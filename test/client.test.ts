@@ -9,7 +9,7 @@ import { encode } from "../src/codec.ts"
 import { ConnectionError, ConnectionRefused, connect, ConnectionStatus, InvalidTopic, SubscribeRejected } from "../src/index.ts"
 import type { Message } from "../src/index.ts"
 import * as P from "../src/packet.ts"
-import { aedes, closedPort, scripted } from "./brokers.ts"
+import { aedes, closedPort, scripted, selfSigned } from "./brokers.ts"
 
 const run = <A, E>(effect: Effect.Effect<A, E, import("effect/Scope").Scope>) => Effect.runPromise(Effect.scoped(effect))
 
@@ -93,6 +93,16 @@ describe("connect", () => {
 
         expect(error).toBeInstanceOf(ConnectionRefused)
         expect(error instanceof ConnectionRefused && error.returnCode).toBe(4)
+      })
+    ))
+
+  it("connects over TLS to an IP address, as Bambu Lab printers are reached", () =>
+    run(
+      Effect.gen(function* () {
+        const port = yield* scripted(() => {}, selfSigned())
+        const client = yield* connect({ host, port, tls: { rejectUnauthorized: false } })
+
+        expect((yield* client.status)._tag).toBe("Connected")
       })
     ))
 
