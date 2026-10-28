@@ -189,7 +189,9 @@ describe("connect", () => {
      */
     const brokerSideClosed = (socket: net.Socket | undefined) =>
       Effect.callback<void>((resume) => {
-        if (socket === undefined || socket.destroyed) return resume(Effect.void)
+        if (socket === undefined) return resume(Effect.die("the broker accepted no connection"))
+
+        if (socket.destroyed) return resume(Effect.void)
 
         socket.write(Buffer.from([0x30, 0xff, 0xff, 0xff, 0x7f]))
 
@@ -237,10 +239,11 @@ describe("connect", () => {
     it("destroys the socket when connecting is interrupted before CONNACK", () =>
       run(
         Effect.gen(function* () {
-          const { port, sockets } = yield* scripted(() => {}, { allowHalfOpen: true, connack: false })
+          const connectSeen = yield* Deferred.make<void>()
+          const { port, sockets } = yield* scripted(() => Deferred.doneUnsafe(connectSeen, Effect.void), { allowHalfOpen: true, connack: false })
           const connecting = yield* Effect.forkChild(Effect.scoped(connect({ host, port })), { startImmediately: true })
 
-          yield* Effect.sleep("100 millis")
+          yield* Deferred.await(connectSeen)
           yield* Fiber.interrupt(connecting)
           yield* brokerSideClosed(sockets[0])
         })
