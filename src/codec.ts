@@ -20,10 +20,35 @@ const stringSize = (s: string): number => {
   return 2 + n
 }
 
+const SLAB_BYTES = 65_536
+const MAX_SLICE_BYTES = 4096
+let slab = Buffer.allocUnsafeSlow(SLAB_BYTES)
+let slabOffset = 0
+
+/**
+ * Hands out small packets as slices of a shared slab, which Node's `Buffer.allocUnsafe` pool does only up to 4 KB
+ * and Bun does not do at all. A slab is never reused; it is freed once every packet sliced from it is.
+ */
+const take = (size: number): Buffer => {
+  if (size > MAX_SLICE_BYTES) return Buffer.allocUnsafe(size)
+
+  if (slabOffset + size > SLAB_BYTES) {
+    slab = Buffer.allocUnsafeSlow(SLAB_BYTES)
+    slabOffset = 0
+  }
+
+  const out = slab.subarray(slabOffset, slabOffset + size)
+
+  // Keep slices 8-byte aligned, as Node's pool does.
+  slabOffset = (slabOffset + size + 7) & ~7
+
+  return out
+}
+
 /** Allocates a packet and writes its fixed header. The body starts at `buf.length - remaining`. */
 const allocate = (first: number, remaining: number): Buffer => {
   if (remaining > MAX_REMAINING_LENGTH) throw malformed(`packet of ${remaining} bytes exceeds the MQTT limit`)
-  const buf = Buffer.allocUnsafe(1 + varintSize(remaining) + remaining)
+  const buf = take(1 + varintSize(remaining) + remaining)
   buf[0] = first
   let offset = 1
   let n = remaining
