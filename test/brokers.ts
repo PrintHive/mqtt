@@ -1,5 +1,7 @@
 import type { Buffer } from "node:buffer"
+import { readFileSync } from "node:fs"
 import * as net from "node:net"
+import * as tls from "node:tls"
 import { Aedes } from "aedes"
 import type { AedesOptions, Client } from "aedes"
 import * as Effect from "effect/Effect"
@@ -55,9 +57,9 @@ export const aedes = (options?: AedesOptions) =>
   })
 
 /** A scripted broker that answers the first packet (CONNECT) with CONNACK and hands every later packet to `onPacket`. */
-export const scripted = (onPacket: (packet: Packet, socket: net.Socket) => void) =>
+export const scripted = (onPacket: (packet: Packet, socket: net.Socket) => void, secure?: tls.TlsOptions) =>
   Effect.gen(function* () {
-    const server = net.createServer((socket) => {
+    const handle = (socket: net.Socket) => {
       let connected = false
 
       const decoder = new Decoder((packet) => {
@@ -76,10 +78,16 @@ export const scripted = (onPacket: (packet: Packet, socket: net.Socket) => void)
         }
       })
       socket.on("error", () => socket.destroy())
-    })
+    }
 
-    return yield* listen(server)
+    return yield* listen(secure ? tls.createServer(secure, handle) : net.createServer(handle))
   })
 
 /** A local port with nothing listening on it. */
 export const closedPort = Effect.scoped(listen(net.createServer()))
+
+/** A self-signed certificate for 127.0.0.1 that exists only for these tests. It protects nothing. */
+export const selfSigned = (): tls.TlsOptions => ({
+  key: readFileSync(new URL("fixtures/test-only-key.pem", import.meta.url)),
+  cert: readFileSync(new URL("fixtures/test-only-cert.pem", import.meta.url))
+})

@@ -9,6 +9,7 @@ import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Latch from "effect/Latch"
 import * as Match from "effect/Match"
+import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Schedule from "effect/Schedule"
 import type * as Scope from "effect/Scope"
@@ -99,6 +100,8 @@ interface Config {
   readonly connectTimeout: Duration.Input
   readonly reconnect: Schedule.Schedule<unknown, MqttError> | false
 }
+
+const crashed = (cause: Cause.Cause<MqttError>) => new ClientClosed({ message: `the client crashed: ${Cause.pretty(cause)}` })
 
 const DEFAULT_RECONNECT = Schedule.min([Schedule.exponential("500 millis"), Schedule.spaced("30 seconds")])
 
@@ -235,11 +238,24 @@ class Connection implements Link {
   }
 }
 
+/** SNI must be a host name; RFC 6066 forbids an IP address, and `tls.connect` throws on one. */
+const serverName = (config: Config, secure: tls.ConnectionOptions) =>
+  secure.servername ?? (net.isIP(config.host) === 0 ? config.host : undefined)
+
+const createSocket = (config: Config): net.Socket =>
+  config.tls
+    ? tls.connect({ ...config.tls, host: config.host, port: config.port, servername: serverName(config, config.tls) })
+    : net.connect({ host: config.host, port: config.port })
+
 const openSocket = (config: Config) =>
   Effect.callback<net.Socket, ConnectionError>((resume, signal) => {
-    const socket = config.tls
-      ? tls.connect({ ...config.tls, host: config.host, port: config.port, servername: config.tls.servername ?? config.host })
-      : net.connect({ host: config.host, port: config.port })
+    let socket: net.Socket
+
+    try {
+      socket = createSocket(config)
+    } catch (cause) {
+      return resume(Effect.fail(new ConnectionError({ message: cause instanceof Error ? cause.message : String(cause) })))
+    }
 
     const onError = (e: Error) => {
       socket.destroy()
@@ -381,7 +397,10 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
       })
 
     yield* supervise.pipe(
-      Effect.catch(shutdown),
+      // A defect still closes the client with its cause, so `connect` and the streams report it instead of hanging.
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause) ? Effect.failCause(cause) : shutdown(Cause.findErrorOption(cause).pipe(Option.getOrElse(() => crashed(cause))))
+      ),
       Effect.ensuring(Effect.suspend(() => (closed ? Effect.void : shutdown(new ClientClosed({ message: "the client scope closed" }))))),
       Effect.forkScoped
     )
