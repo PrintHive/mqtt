@@ -221,6 +221,10 @@ class Connection implements Link {
     return this.socket.write(buf)
   }
 
+  get accepting(): boolean {
+    return !this.socket.destroyed
+  }
+
   pong(): void {
     this.pingSentAt = undefined
   }

@@ -434,8 +434,12 @@ describe("connect", () => {
 
           yield* Effect.sleep("500 millis")
 
-          // The client stopped reading, so bytes back up in the broker's socket instead of the client's memory.
-          expect(broker.writableLength).toBeGreaterThan(0)
+          // A client still reading would drain the broker's queue within milliseconds on loopback. A paused one leaves
+          // it full and unchanged, so the bytes wait in the broker's socket instead of the client's memory.
+          const queued = broker.writableLength
+
+          yield* Effect.sleep("300 millis")
+          expect([queued > 0, broker.writableLength]).toEqual([true, queued])
 
           const got = yield* messages.pipe(Stream.take(COUNT), Stream.runCollect)
 

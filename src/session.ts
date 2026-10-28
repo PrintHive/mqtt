@@ -9,6 +9,11 @@ import type { Packet, Publish, PublishAcknowledged, QoS, SubackCode, Subscriptio
 
 /** The open connection a session writes to. */
 export interface Link {
+  /**
+   * False once the socket is destroyed. A connection can fail a moment before the session detaches it, and a write in
+   * that moment goes nowhere.
+   */
+  readonly accepting: boolean
   /** Returns false when the socket buffer is full and the caller should wait for drain. */
   write(buf: Buffer): boolean
   pong(): void
@@ -67,10 +72,11 @@ export class Session {
       const done = Deferred.makeUnsafe<void, MqttError>()
       const packet = P.publishAcknowledged(topic, payload, qos, packetId, retain, false)
 
-      const f: InFlight = { packet, stage: "Unacked", written: this.link !== undefined, done }
+      const link = this.link?.accepting ? this.link : undefined
+      const f: InFlight = { packet, stage: "Unacked", written: link !== undefined, done }
 
       this.inFlight.set(packetId, f)
-      this.link?.write(encode(packet))
+      link?.write(encode(packet))
 
       // Once written, the exchange must finish (section 4.4). Before that, an interrupted caller leaves nothing behind.
       return Effect.onInterrupt(Deferred.await(done), () =>
