@@ -54,12 +54,13 @@
     "prepublishOnly": "bun run check && bun run build"
   },
   "peerDependencies": {
-    "effect": "4.0.7"
+    "effect": "^4.0.2"
   },
   "devDependencies": {
     "@oxlint/plugins": "1.90.0",
     "@types/node": "^26",
     "aedes": "^1.2.0",
+    "effect": "4.0.2",
     "mqtt": "^5.16.1",
     "oxlint": "1.90.0",
     "typescript": "^7",

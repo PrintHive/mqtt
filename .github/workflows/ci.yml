@@ -21,6 +21,9 @@ jobs:
         with:
           bun-version-file: package.json
       - run: bun install --frozen-lockfile
+      # `bun add` rewrites a peer-only dependency to an exact version, which locks out every other Effect release.
+      - name: Check the effect peer is a range
+        run: node -e "const v = require('./package.json').peerDependencies.effect; if (!v.startsWith('^')) { console.error('peerDependencies.effect must be a ^ range, got ' + v); process.exit(1) }"
       - run: bun run lint
       - run: bun run typecheck
       - run: bun test
