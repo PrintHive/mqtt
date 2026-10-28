@@ -16,6 +16,7 @@ const size = Number(sizeArg)
 const count = Number(countArg)
 const port = Number(portArg)
 const body = payload(size)
+
 /** Outstanding QoS 1 publishes allowed at once, for both libraries. */
 const WINDOW = 1000
 
@@ -75,6 +76,7 @@ const theirs = () =>
 
       let sent = 0
       let outstanding = 0
+
       const pump = () => {
         while (outstanding < WINDOW && sent < count) {
           sent++

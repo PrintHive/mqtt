@@ -25,6 +25,7 @@ const runs = {
   "decode ours": () => {
     let count = 0
     let bytes = 0
+
     const d = new Decoder((p) => {
       count++
       bytes += "payload" in p ? p.payload.length : 0
@@ -41,9 +42,9 @@ const runs = {
     let bytes = 0
     const parser = mqttPacket.parser({ protocolVersion: 4 })
 
-    parser.on("packet", (p: { payload: Buffer }) => {
+    parser.on("packet", (p) => {
       count++
-      bytes += p.payload.length
+      bytes += p.cmd === "publish" ? Buffer.byteLength(p.payload) : 0
     })
 
     for (const c of chunks) parser.parse(c)

@@ -9,11 +9,13 @@ import { spawnSync } from "node:child_process"
 
 const port = process.env["MQTT_BENCH_PORT"] ?? "18830"
 const ROUNDS = 5
+
 const scenarios = [
   { qos: "0", size: "64", count: "200000" },
   { qos: "0", size: "1024", count: "100000" },
   { qos: "1", size: "1024", count: "50000" }
 ]
+
 const runtimes = [
   ["bun", "bench/e2e.ts"],
   ["node", "bench/e2e.ts"]
@@ -48,6 +50,7 @@ const stats = (xs: Array<number>) => {
 const k = (n: number) => `${(n / 1000).toFixed(0)}k`
 
 console.log("| Runtime | QoS | Payload | @printhive/mqtt msg/s | mqtt.js msg/s | Ratio |")
+
 console.log("| --- | --- | --- | --- | --- | --- |")
 
 for (const [runtime = "bun", script = ""] of runtimes) {
