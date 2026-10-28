@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto"
 import * as net from "node:net"
 import * as tls from "node:tls"
 import * as Cause from "effect/Cause"
+import * as Clock from "effect/Clock"
 import * as Data from "effect/Data"
 import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
@@ -166,13 +167,16 @@ class Connection implements Link {
   private readonly onDrain: () => void
   private error: MqttError | undefined = undefined
   private corked = false
-  private lastWrite = Date.now()
+  /** Effect's Clock, so `TestClock` drives keep-alive in tests. */
+  private readonly clock: Clock.Clock
+  private lastWrite: number
   /** When the unanswered PINGREQ went out, or undefined when none is outstanding. */
   private pingSentAt: number | undefined = undefined
   private reading = true
-  private timer: ReturnType<typeof setInterval> | undefined = undefined
 
-  constructor(socket: net.Socket, session: Session, onDrain: () => void) {
+  constructor(socket: net.Socket, session: Session, onDrain: () => void, clock: Clock.Clock) {
+    this.clock = clock
+    this.lastWrite = clock.currentTimeMillisUnsafe()
     this.socket = socket
     this.onDrain = onDrain
 
@@ -194,8 +198,6 @@ class Connection implements Link {
       this.error ??= new ConnectionError({ message: e.message })
     })
     socket.on("close", () => {
-      clearInterval(this.timer)
-
       const error = this.error ?? new ConnectionError({ message: "the connection closed" })
 
       Deferred.doneUnsafe(this.connack, Effect.fail(error))
@@ -204,7 +206,7 @@ class Connection implements Link {
   }
 
   write(buf: Buffer): boolean {
-    this.lastWrite = Date.now()
+    this.lastWrite = this.clock.currentTimeMillisUnsafe()
 
     // Corking until the microtask queue drains turns a burst of small packets into one syscall.
     if (!this.corked) {
@@ -245,11 +247,11 @@ class Connection implements Link {
    * when a PINGREQ gets no PINGRESP within one period. Checking every quarter period and pinging after three quarters
    * of quiet sends the PINGREQ before the full period passes.
    */
-  startKeepAlive(periodMs: number): void {
-    if (periodMs === 0) return
+  keepAlive(periodMs: number): Effect.Effect<void> {
+    if (periodMs === 0) return Effect.void
 
-    this.timer = setInterval(() => {
-      const now = Date.now()
+    const tick = Effect.sync(() => {
+      const now = this.clock.currentTimeMillisUnsafe()
 
       // While paused, keep pinging so the broker keeps the connection, but a PINGRESP cannot be read yet.
       if (!this.reading) {
@@ -268,8 +270,9 @@ class Connection implements Link {
         this.pingSentAt = now
         this.write(encode(P.pingreq))
       }
-    }, periodMs / 4)
-    this.timer.unref()
+    })
+
+    return Effect.asVoid(Effect.repeat(tick, Schedule.spaced(periodMs / 4)))
   }
 
   /**
@@ -278,8 +281,6 @@ class Connection implements Link {
    */
   close(force: boolean, graceMs: Duration.Input): Effect.Effect<void> {
     return Effect.suspend(() => {
-      clearInterval(this.timer)
-
       const gone = Effect.asVoid(Deferred.await(this.lost))
 
       if (this.socket.destroyed) return gone
@@ -339,7 +340,7 @@ const openSocket = (config: Config) =>
 const establish = (config: Config, session: Session, onDrain: () => void, forced: () => boolean) =>
   Effect.gen(function* () {
     const socket = yield* openSocket(config)
-    const connection = new Connection(socket, session, onDrain)
+    const connection = new Connection(socket, session, onDrain, yield* Clock.Clock)
 
     yield* Effect.addFinalizer(() => connection.close(forced(), config.connectTimeout))
     connection.write(encode(config.connect))
@@ -348,7 +349,8 @@ const establish = (config: Config, session: Session, onDrain: () => void, forced
 
     if (connack.returnCode !== 0) return yield* Effect.fail(refused(connack.returnCode))
 
-    connection.startKeepAlive(config.keepAliveMs)
+    // Forked into the connection's scope, so it stops when the connection does.
+    yield* Effect.forkScoped(connection.keepAlive(config.keepAliveMs))
 
     return { connection, sessionPresent: connack.sessionPresent }
   }).pipe(

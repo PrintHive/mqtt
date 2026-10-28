@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Schedule from "effect/Schedule"
 import * as Stream from "effect/Stream"
+import * as TestClock from "effect/testing/TestClock"
 import { describe, expect, it } from "vitest"
 import { encode } from "../src/codec.ts"
 import { ClientClosed, ConnectionError, ConnectionRefused, connect, ConnectionStatus, InvalidOption, InvalidTopic, SubscribeRejected } from "../src/index.ts"
@@ -441,6 +442,27 @@ describe("connect", () => {
         })
       ))
   })
+
+  it("runs keep-alive on Effect's Clock, so TestClock drives PINGREQ and the PINGRESP deadline", () =>
+    run(
+      Effect.gen(function* () {
+        const seen: Array<string> = []
+        const { port } = yield* scripted((packet) => void seen.push(packet._tag))
+        const client = yield* connect({ host, port, keepAlive: "60 seconds", reconnect: false })
+        // Virtual time moves the timers; socket I/O still needs a moment of real time.
+        const settle = Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 50)))
+
+        yield* TestClock.adjust("44 seconds")
+        yield* settle
+        expect(seen).toEqual([])
+        yield* TestClock.adjust("2 seconds")
+        yield* settle
+        expect(seen).toEqual(["Pingreq"])
+        yield* TestClock.adjust("60 seconds")
+        yield* settle
+        expect((yield* client.status)._tag).toBe("Closed")
+      }).pipe(Effect.provide(TestClock.layer()))
+    ))
 
   it("drops a connection whose broker stops answering PINGREQ", () =>
     run(
