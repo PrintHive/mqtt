@@ -1,6 +1,6 @@
 {
   "name": "@printhive/mqtt",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A fast MQTT 3.1.1 client for Effect, on Bun and Node.js",
   "keywords": [
     "mqtt",
