@@ -56,11 +56,26 @@ export const aedes = (options?: AedesOptions) =>
     }
   })
 
-/** A scripted broker that answers the first packet (CONNECT) with CONNACK and hands every later packet to `onPacket`. */
-export const scripted = (onPacket: (packet: Packet, socket: net.Socket) => void, secure?: tls.TlsOptions) =>
+export interface ScriptOptions {
+  readonly tls?: tls.TlsOptions | undefined
+  /** Keeps the broker's half of the connection open after the client's FIN, as some peers do. */
+  readonly allowHalfOpen?: boolean | undefined
+  /** Defaults to true. With false, CONNECT goes to `onPacket` and nothing answers it. */
+  readonly connack?: boolean | undefined
+}
+
+/**
+ * A scripted broker that answers the first packet (CONNECT) with CONNACK and hands every later packet to `onPacket`.
+ * `sockets` holds every connection it accepted.
+ */
+export const scripted = (onPacket: (packet: Packet, socket: net.Socket) => void, options?: ScriptOptions) =>
   Effect.gen(function* () {
+    const sockets: Array<net.Socket> = []
+
     const handle = (socket: net.Socket) => {
-      let connected = false
+      let connected = options?.connack === false
+
+      sockets.push(socket)
 
       const decoder = new Decoder((packet) => {
         if (connected) return onPacket(packet, socket)
@@ -80,7 +95,11 @@ export const scripted = (onPacket: (packet: Packet, socket: net.Socket) => void,
       socket.on("error", () => socket.destroy())
     }
 
-    return yield* listen(secure ? tls.createServer(secure, handle) : net.createServer(handle))
+    const allowHalfOpen = options?.allowHalfOpen ?? false
+    const server = options?.tls ? tls.createServer({ ...options.tls, allowHalfOpen }, handle) : net.createServer({ allowHalfOpen }, handle)
+    const port = yield* listen(server)
+
+    return { port, sockets }
   })
 
 /** A local port with nothing listening on it. */
