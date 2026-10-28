@@ -6,7 +6,7 @@ import * as Schedule from "effect/Schedule"
 import * as Stream from "effect/Stream"
 import { describe, expect, it } from "vitest"
 import { encode } from "../src/codec.ts"
-import { ConnectionError, ConnectionRefused, connect, ConnectionStatus, InvalidTopic } from "../src/index.ts"
+import { ConnectionError, ConnectionRefused, connect, ConnectionStatus, InvalidTopic, SubscribeRejected } from "../src/index.ts"
 import type { Message } from "../src/index.ts"
 import * as P from "../src/packet.ts"
 import { aedes, closedPort, scripted } from "./brokers.ts"
@@ -223,6 +223,28 @@ describe("connect", () => {
         yield* client.publish("t", "x", { qos: 2 })
 
         expect((yield* high.pipe(Stream.take(1), Stream.runCollect)).map(summary)).toEqual([["t", "x", 2, false]])
+      })
+    ))
+
+  it("lets a filter be retried at a lower QoS after the broker rejects a higher one", () =>
+    run(
+      Effect.gen(function* () {
+        const requestedQos: Array<number> = []
+
+        const port = yield* scripted((packet, socket) => {
+          if (!("subscriptions" in packet)) return
+
+          const qos = packet.subscriptions[0]?.qos ?? 0
+
+          requestedQos.push(qos)
+          socket.write(encode(P.suback(packet.packetId, [qos === 2 ? 0x80 : qos])))
+        })
+
+        const client = yield* connect({ host, port })
+
+        expect(yield* Effect.flip(client.subscribe("t", { qos: 2 }))).toBeInstanceOf(SubscribeRejected)
+        yield* client.subscribe("t", { qos: 0 })
+        expect(requestedQos).toEqual([2, 0])
       })
     ))
 

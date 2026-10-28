@@ -412,6 +412,7 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
       })
     }
 
+    /** Unregisters a subscriber. Safe to call again for the same subscriber. */
     const release = (subscriber: Subscriber) =>
       Effect.suspend(() => {
         subscribers.remove(subscriber.filter, subscriber)
@@ -444,9 +445,14 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
           yield* Effect.addFinalizer(() => release(subscriber))
 
           // SUBSCRIBE replaces the broker's subscription on an identical filter, QoS included (section 3.8.4).
-          const [code] = yield* session.subscribe([{ filter, qos: requested(filter) }])
+          // A failed subscriber leaves now rather than at scope close, so a retry at a lower QoS is not held to this one's.
+          const [code] = yield* Effect.onError(session.subscribe([{ filter, qos: requested(filter) }]), () => release(subscriber))
 
-          if (code === 0x80 || code === undefined) return yield* Effect.fail(new SubscribeRejected({ filter }))
+          if (code === 0x80 || code === undefined) {
+            yield* release(subscriber)
+
+            return yield* Effect.fail(new SubscribeRejected({ filter }))
+          }
 
           return Stream.fromQueue(queue)
         })
