@@ -31,3 +31,7 @@ Measured on 2026-10-28 on an Apple M3 Pro (12 cores) with Bun 1.4.0, Node.js 26.
 | node | encode | 5.65M (4.61M to 6.19M) | 1.79M (1.59M to 2.05M) |
 
 Decoding returns payloads as views of the socket chunk instead of copies. Encoding first measured 1.91M packets/s on Bun, the same as mqtt-packet. Bun's `Buffer.allocUnsafe` has no small-buffer pool, so every packet was a fresh allocation; slicing packets from a 64 KB slab doubled it.
+
+## Noise
+
+Absolute rates on this machine moved by about 4x with the unrelated load. A Bun rerun at load average 25.7 measured decode at 0.73M vs 0.24M packets/s and encode at 0.78M vs 0.52M. The ratios held (3.0x and 1.5x), so compare ratios between runs, not absolute rates.
