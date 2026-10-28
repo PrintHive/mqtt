@@ -397,30 +397,39 @@ describe("connect", () => {
     const COUNT = 2000
     const SIZE = 16_384
 
-    /** A broker that answers PINGREQ, confirms SUBSCRIBE, then writes 32 MB of numbered messages as fast as it can. */
-    const flooding = Effect.gen(function* () {
-      const flooded = yield* Deferred.make<net.Socket>()
-      const pingreq = encode(P.pingreq)
+    /**
+     * A broker that answers PINGREQ and confirms each SUBSCRIBE. After the `subscribes`th one, it writes 32 MB of
+     * numbered messages as fast as it can.
+     */
+    const flood = (subscribes: number) =>
+      Effect.gen(function* () {
+        const flooded = yield* Deferred.make<net.Socket>()
+        const pingreq = encode(P.pingreq)
+        let seen = 0
 
-      const { port } = yield* scripted((packet, socket) => {
-        if (Buffer.compare(encode(packet), pingreq) === 0) return void socket.write(encode(P.pingresp))
+        const { port } = yield* scripted((packet, socket) => {
+          if (Buffer.compare(encode(packet), pingreq) === 0) return void socket.write(encode(P.pingresp))
 
-        if (!("subscriptions" in packet)) return
+          if (!("subscriptions" in packet)) return
 
-        socket.write(encode(P.suback(packet.packetId, [0])))
+          socket.write(encode(P.suback(packet.packetId, [0])))
 
-        for (let i = 0; i < COUNT; i++) {
-          const payload = Buffer.alloc(SIZE)
+          if (++seen < subscribes) return
 
-          payload.writeUInt32BE(i)
-          socket.write(encode(P.publishAtMostOnce("flood", payload, false)))
-        }
+          for (let i = 0; i < COUNT; i++) {
+            const payload = Buffer.alloc(SIZE)
 
-        Deferred.doneUnsafe(flooded, Effect.succeed(socket))
+            payload.writeUInt32BE(i)
+            socket.write(encode(P.publishAtMostOnce("flood", payload, false)))
+          }
+
+          Deferred.doneUnsafe(flooded, Effect.succeed(socket))
+        })
+
+        return { port, flooded }
       })
 
-      return { port, flooded }
-    })
+    const flooding = flood(1)
 
     const inOrder = (messages: ReadonlyArray<Message>) => messages.every((m, i) => Buffer.from(m.payload).readUInt32BE(0) === i)
 
@@ -446,6 +455,32 @@ describe("connect", () => {
           expect(got.length).toBe(COUNT)
           expect(inOrder(got)).toBe(true)
           expect(broker.writableLength).toBe(0)
+        })
+      ), 15_000)
+
+    it("counts the chunk a slow consumer still holds against bufferSize", () =>
+      run(
+        Effect.gen(function* () {
+          const capacity = 256
+          const { port, flooded } = yield* flood(2)
+          const client = yield* connect({ host, port })
+          const slow = yield* client.subscribe("flood", { bufferSize: capacity })
+          // A second, fast subscriber on the same filter counts every message the client has read off the socket.
+          const counter = yield* client.subscribe("flood", { bufferSize: COUNT })
+          let read = 0
+
+          yield* Effect.forkChild(Stream.runForEach(counter, () => Effect.sync(() => void read++)), { startImmediately: true })
+          yield* Deferred.await(flooded)
+          yield* Effect.sleep("300 millis")
+
+          const whenFull = read
+
+          // The slow consumer arrives only once its buffer is full, takes one chunk, and never finishes it. Releasing
+          // that chunk on take would resume reading and let another bufferSize in.
+          yield* Effect.forkChild(Stream.runForEach(slow, () => Effect.never), { startImmediately: true })
+          yield* Effect.sleep("500 millis")
+          expect(whenFull).toBeGreaterThanOrEqual(capacity)
+          expect(read - whenFull).toBeLessThan(capacity / 2)
         })
       ), 15_000)
 

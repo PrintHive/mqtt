@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer"
 import { randomBytes } from "node:crypto"
 import * as net from "node:net"
 import * as tls from "node:tls"
+import * as Arr from "effect/Array"
 import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Data from "effect/Data"
@@ -111,7 +112,12 @@ interface Subscriber {
   readonly qos: QoS
   readonly capacity: number
   readonly queue: Queue.Queue<Message, MqttError | Cause.Done>
+  /** Messages the consumer took in its last pull and may still be working through. They count against `capacity`. */
+  held: number
 }
+
+/** Messages a subscriber has in memory: queued, plus the chunk its consumer last took. */
+const buffered = (s: Subscriber) => Queue.sizeUnsafe(s.queue) + s.held
 
 const DEFAULT_BUFFER_SIZE = 1024
 
@@ -396,15 +402,15 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
     const deliver = (s: Subscriber, message: Message) => {
       Queue.offerUnsafe(s.queue, message)
 
-      if (full.has(s) || Queue.sizeUnsafe(s.queue) < s.capacity) return
+      if (full.has(s) || buffered(s) < s.capacity) return
 
       full.add(s)
       current?.setReading(false)
     }
 
-    /** Called after a subscriber's stream takes messages, and when it leaves. */
+    /** Called when a subscriber's consumer comes back for more, and when it leaves. */
     const drained = (s: Subscriber) => {
-      if (!full.has(s) || Queue.sizeUnsafe(s.queue) > s.capacity / 2) return
+      if (!full.has(s) || buffered(s) > s.capacity / 2) return
 
       full.delete(s)
 
@@ -562,7 +568,7 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
 
           // Unbounded underneath: the bound is enforced by pausing the socket, so a message already read is never dropped.
           const queue = yield* Queue.unbounded<Message, MqttError | Cause.Done>()
-          const subscriber: Subscriber = { filter, qos, capacity, queue }
+          const subscriber: Subscriber = { filter, qos, capacity, queue, held: 0 }
           const set = filters.get(filter) ?? new Set()
 
           // Register before SUBSCRIBE goes out, so retained messages that race the SUBACK are kept.
@@ -580,13 +586,21 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
             return yield* Effect.fail(new SubscribeRejected({ filter }))
           }
 
-          return Stream.fromQueue(queue).pipe(
-            Stream.mapArray((messages) => {
-              drained(subscriber)
+          // A pull means the consumer finished the previous chunk, so only then is that chunk released. Releasing it as
+          // it was taken would let the queue refill while the consumer still held it, doubling the buffer.
+          const pull = Effect.suspend(() => {
+            subscriber.held = 0
+            drained(subscriber)
 
-              return messages
+            return Effect.flatMap(Queue.takeBetween(queue, 1, capacity), (messages) => {
+              subscriber.held = messages.length
+
+              // takeBetween waits for at least one message, so the empty branch never runs.
+              return Arr.isReadonlyArrayNonEmpty(messages) ? Effect.succeed(messages) : Effect.die("takeBetween returned no messages")
             })
-          )
+          })
+
+          return Stream.fromPull(Effect.succeed(pull))
         })
 
     return {
