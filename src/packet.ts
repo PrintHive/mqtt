@@ -167,3 +167,5 @@ export const pingreq: Pingreq = { _tag: "Pingreq" }
 export const pingresp: Pingresp = { _tag: "Pingresp" }
 
 export const disconnect: Disconnect = { _tag: "Disconnect" }
+
+export const isConnack = (p: Packet): p is Connack => p._tag === "Connack"
