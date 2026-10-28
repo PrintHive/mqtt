@@ -221,8 +221,9 @@ class Connection implements Link {
     return this.socket.write(buf)
   }
 
+  /** False once the socket has ended its writing side or been destroyed; a write then goes nowhere. */
   get accepting(): boolean {
-    return !this.socket.destroyed
+    return this.socket.writable
   }
 
   pong(): void {

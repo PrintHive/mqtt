@@ -10,8 +10,8 @@ import type { Packet, Publish, PublishAcknowledged, QoS, SubackCode, Subscriptio
 /** The open connection a session writes to. */
 export interface Link {
   /**
-   * False once the socket is destroyed. A connection can fail a moment before the session detaches it, and a write in
-   * that moment goes nowhere.
+   * False once the socket has ended or been destroyed. A connection can fail a moment before the session detaches it,
+   * and a write in that moment goes nowhere.
    */
   readonly accepting: boolean
   /** Returns false when the socket buffer is full and the caller should wait for drain. */
@@ -119,6 +119,9 @@ export class Session {
     this.link = link
 
     if (!sessionPresent) this.received.clear()
+
+    // A link that failed between CONNACK and attach takes nothing, and nothing it was handed counts as written.
+    if (!link.accepting) return
 
     for (const [id, f] of this.inFlight) {
       link.write(encode(f.stage === "Released" ? P.pubrel(id) : { ...f.packet, dup: f.written }))

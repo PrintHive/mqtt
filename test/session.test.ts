@@ -36,4 +36,22 @@ describe("Session", () => {
         expect([dead.written, next.written]).toEqual([[], []])
       })
     ))
+
+  it("does not count a replay onto an already-destroyed link as written", () =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        const session = new Session(() => {})
+        const publish = yield* Effect.forkChild(session.publishAcknowledged("jobs", Buffer.from("print"), 1, false), { startImmediately: true })
+        const dead = recording(false)
+
+        session.attach(dead.link, false)
+        session.detach()
+        yield* Fiber.interrupt(publish)
+
+        const next = recording(true)
+
+        session.attach(next.link, true)
+        expect([dead.written, next.written]).toEqual([[], []])
+      })
+    ))
 })
