@@ -85,7 +85,7 @@ Each subscription holds up to `bufferSize` messages, 1024 by default:
 const reports = yield* client.subscribe("device/+/report", { bufferSize: 64 })
 ```
 
-When a subscription is full, the client stops reading from the socket. TCP then pushes back on the broker, which queues or drops messages according to its own limits. Reading resumes once every full subscription has drained to half. The client keeps sending PINGREQ while paused, so a slow consumer does not cost the connection. Messages already read when a buffer fills are kept, so a buffer can exceed `bufferSize` by one socket read's worth.
+When a subscription is full, the client stops reading from the socket. TCP then pushes back on the broker, which queues or drops messages according to its own limits. Reading resumes once every full subscription has drained to half. The client keeps sending PINGREQ while paused, so a slow consumer does not cost the connection. It cannot read the PINGRESP until it resumes, though. A dead host or network still fails those PINGREQ writes at the TCP level, but a broker that stops answering while keeping its TCP connection open is detected only once the consumer catches up and reading resumes. Messages already read when a buffer fills are kept, so a buffer can exceed `bufferSize` by one socket read's worth.
 
 ## Connection status
 
