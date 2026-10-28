@@ -1,6 +1,6 @@
 export { connect, ConnectionStatus } from "./client.ts"
 
-export type { ConnectOptions, Message, MqttClient, PublishOptions, SubscribeOptions } from "./client.ts"
+export type { CloseOptions, ConnectOptions, Message, MqttClient, PublishOptions, SubscribeOptions } from "./client.ts"
 
 export { MalformedPacket } from "./codec.ts"
 

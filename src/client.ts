@@ -7,6 +7,7 @@ import * as Data from "effect/Data"
 import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as Latch from "effect/Latch"
 import * as Match from "effect/Match"
 import * as Option from "effect/Option"
@@ -49,6 +50,11 @@ export interface ConnectOptions {
   readonly reconnect?: Schedule.Schedule<unknown, MqttError> | false | undefined
 }
 
+export interface CloseOptions {
+  /** Destroys the socket without sending DISCONNECT. Defaults to false. */
+  readonly force?: boolean | undefined
+}
+
 export interface PublishOptions {
   /** Defaults to 0. QoS 1 and 2 publishes complete when the broker acknowledges them. */
   readonly qos?: QoS | undefined
@@ -83,6 +89,12 @@ export interface MqttClient {
   readonly subscribe: (filter: string, options?: SubscribeOptions) => Effect.Effect<Stream.Stream<Message, MqttError>, MqttError, Scope.Scope>
   readonly status: Effect.Effect<ConnectionStatus>
   readonly statusChanges: Stream.Stream<ConnectionStatus>
+  /**
+   * Closes the client before its scope does, and completes once the socket is gone. It stops reconnecting, then sends
+   * DISCONNECT and waits up to `connectTimeout` for the broker to hang up. With `force`, it destroys the socket at
+   * once without DISCONNECT, so the broker publishes the will. Calling it again does nothing.
+   */
+  readonly close: (options?: CloseOptions) => Effect.Effect<void>
 }
 
 interface Subscriber {
@@ -229,12 +241,33 @@ class Connection implements Link {
     this.timer.unref()
   }
 
-  close(): void {
-    clearInterval(this.timer)
+  /**
+   * Closes the socket and completes once it is gone. A graceful close sends DISCONNECT and waits up to `graceMs` for
+   * the broker to hang up before destroying the socket. A forced close, or one before CONNACK, destroys it at once.
+   */
+  close(force: boolean, graceMs: Duration.Input): Effect.Effect<void> {
+    return Effect.suspend(() => {
+      clearInterval(this.timer)
 
-    if (this.socket.destroyed) return
+      const gone = Effect.asVoid(Deferred.await(this.lost))
 
-    this.socket.end(encode(P.disconnect))
+      if (this.socket.destroyed) return gone
+
+      if (force || !Deferred.isDoneUnsafe(this.connack)) {
+        this.socket.destroy()
+
+        return gone
+      }
+
+      this.socket.end(encode(P.disconnect))
+
+      return gone.pipe(
+        Effect.timeoutOrElse({
+          duration: graceMs,
+          orElse: () => Effect.andThen(Effect.sync(() => this.socket.destroy()), gone)
+        })
+      )
+    })
   }
 }
 
@@ -272,12 +305,12 @@ const openSocket = (config: Config) =>
   })
 
 /** Opens a socket and completes the CONNECT handshake. The connection closes with the enclosing scope. */
-const establish = (config: Config, session: Session, onDrain: () => void) =>
+const establish = (config: Config, session: Session, onDrain: () => void, forced: () => boolean) =>
   Effect.gen(function* () {
     const socket = yield* openSocket(config)
     const connection = new Connection(socket, session, onDrain)
 
-    yield* Effect.addFinalizer(() => Effect.sync(() => connection.close()))
+    yield* Effect.addFinalizer(() => connection.close(forced(), config.connectTimeout))
     connection.write(encode(config.connect))
 
     const connack = yield* Deferred.await(connection.connack)
@@ -323,6 +356,7 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
     const status = yield* SubscriptionRef.make<ConnectionStatus>(ConnectionStatus.Connecting())
     const ready = yield* Deferred.make<void, MqttError>()
     let closed: ClientClosed | undefined = undefined
+    let force = false
 
     const failRejected = (rejected: ReadonlyArray<string>, codes: ReadonlyArray<P.SubackCode>) =>
       Effect.sync(() => {
@@ -334,7 +368,7 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
       })
 
     const run = Effect.gen(function* () {
-      const { connection, sessionPresent } = yield* establish(config, session, () => writable.openUnsafe())
+      const { connection, sessionPresent } = yield* establish(config, session, () => writable.openUnsafe(), () => force)
 
       session.attach(connection, sessionPresent)
 
@@ -396,14 +430,15 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
         yield* Deferred.fail(ready, error)
       })
 
-    yield* supervise.pipe(
+    const supervisor = yield* supervise.pipe(
       // A defect still closes the client with its cause, so `connect` and the streams report it instead of hanging.
       Effect.catchCause((cause) =>
         Cause.hasInterruptsOnly(cause) ? Effect.failCause(cause) : shutdown(Cause.findErrorOption(cause).pipe(Option.getOrElse(() => crashed(cause))))
       ),
-      Effect.ensuring(Effect.suspend(() => (closed ? Effect.void : shutdown(new ClientClosed({ message: "the client scope closed" }))))),
+      Effect.ensuring(Effect.suspend(() => (closed ? Effect.void : shutdown(new ClientClosed({ message: "the client closed" }))))),
       Effect.forkScoped
     )
+
     yield* Deferred.await(ready)
 
     const whenWritable = <A>(f: () => Effect.Effect<A, MqttError>): Effect.Effect<A, MqttError> =>
@@ -481,6 +516,12 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
       publish,
       subscribe,
       status: SubscriptionRef.get(status),
-      statusChanges: SubscriptionRef.changes(status)
+      statusChanges: SubscriptionRef.changes(status),
+      close: (closeOptions?: CloseOptions) =>
+        Effect.suspend(() => {
+          force ||= closeOptions?.force ?? false
+
+          return Fiber.interrupt(supervisor)
+        })
     }
   })

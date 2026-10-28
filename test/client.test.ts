@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer"
+import type * as net from "node:net"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
@@ -6,7 +7,7 @@ import * as Schedule from "effect/Schedule"
 import * as Stream from "effect/Stream"
 import { describe, expect, it } from "vitest"
 import { encode } from "../src/codec.ts"
-import { ConnectionError, ConnectionRefused, connect, ConnectionStatus, InvalidTopic, SubscribeRejected } from "../src/index.ts"
+import { ClientClosed, ConnectionError, ConnectionRefused, connect, ConnectionStatus, InvalidTopic, SubscribeRejected } from "../src/index.ts"
 import type { Message } from "../src/index.ts"
 import * as P from "../src/packet.ts"
 import { aedes, closedPort, scripted, selfSigned } from "./brokers.ts"
@@ -99,7 +100,7 @@ describe("connect", () => {
   it("connects over TLS to an IP address, as Bambu Lab printers are reached", () =>
     run(
       Effect.gen(function* () {
-        const port = yield* scripted(() => {}, selfSigned())
+        const { port } = yield* scripted(() => {}, { tls: selfSigned() })
         const client = yield* connect({ host, port, tls: { rejectUnauthorized: false } })
 
         expect((yield* client.status)._tag).toBe("Connected")
@@ -180,6 +181,72 @@ describe("connect", () => {
       })
     ))
 
+  describe("close", () => {
+    /**
+     * Resolves once the client's socket is gone, as seen from the broker. A half-open peer learns that only when it
+     * writes, so this writes until a write fails: a client still holding the socket open accepts every byte. The bytes
+     * open a PUBLISH that never completes, so the client's decoder only buffers them and cannot react to them.
+     */
+    const brokerSideClosed = (socket: net.Socket | undefined) =>
+      Effect.callback<void>((resume) => {
+        if (socket === undefined || socket.destroyed) return resume(Effect.void)
+
+        socket.write(Buffer.from([0x30, 0xff, 0xff, 0xff, 0x7f]))
+
+        const probe = setInterval(() => socket.write(Buffer.from([0])), 20)
+
+        socket.on("error", () => {})
+        socket.once("close", () => {
+          clearInterval(probe)
+          resume(Effect.void)
+        })
+
+        return Effect.sync(() => clearInterval(probe))
+      }).pipe(Effect.timeoutOrElse({ duration: "200 millis", orElse: () => Effect.die("the broker's socket is still open") }))
+
+    it("destroys the socket when the broker keeps its half open after DISCONNECT", () =>
+      run(
+        Effect.gen(function* () {
+          const seen: Array<string> = []
+          const { port, sockets } = yield* scripted((packet) => void seen.push(packet._tag), { allowHalfOpen: true })
+          const started = Date.now()
+
+          yield* Effect.scoped(connect({ host, port, connectTimeout: "300 millis" }))
+          yield* brokerSideClosed(sockets[0])
+          expect(seen).toEqual(["Disconnect"])
+          expect(Date.now() - started).toBeLessThan(1000)
+        })
+      ))
+
+    it("closes on demand, and with force skips DISCONNECT so the broker publishes the will", () =>
+      run(
+        Effect.gen(function* () {
+          const { port } = yield* aedes()
+          const observer = yield* connect({ host, port })
+          const status = yield* observer.subscribe("status/+")
+          const client = yield* connect({ host, port, will: { topic: "status/forced", payload: Buffer.from("gone"), qos: 0, retain: false } })
+
+          yield* client.close({ force: true })
+          yield* client.close()
+          expect((yield* client.status)._tag).toBe("Closed")
+          expect(yield* Effect.flip(client.publish("t", "x"))).toBeInstanceOf(ClientClosed)
+          expect((yield* status.pipe(Stream.take(1), Stream.runCollect)).map(summary)).toEqual([["status/forced", "gone", 0, false]])
+        })
+      ))
+
+    it("destroys the socket when connecting is interrupted before CONNACK", () =>
+      run(
+        Effect.gen(function* () {
+          const { port, sockets } = yield* scripted(() => {}, { allowHalfOpen: true, connack: false })
+          const connecting = yield* Effect.forkChild(Effect.scoped(connect({ host, port })), { startImmediately: true })
+
+          yield* Effect.sleep("100 millis")
+          yield* Fiber.interrupt(connecting)
+          yield* brokerSideClosed(sockets[0])
+        })
+      ))
+  })
+
   it("unsubscribes when the last subscription on a filter closes", () =>
     run(
       Effect.gen(function* () {
@@ -202,7 +269,7 @@ describe("connect", () => {
       Effect.gen(function* () {
         const seen: Array<string> = []
 
-        const port = yield* scripted((packet, socket) => {
+        const { port } = yield* scripted((packet, socket) => {
           seen.push(packet._tag)
 
           // Confirm only the first SUBSCRIBE, so the second stays pending.
@@ -241,7 +308,7 @@ describe("connect", () => {
       Effect.gen(function* () {
         const requestedQos: Array<number> = []
 
-        const port = yield* scripted((packet, socket) => {
+        const { port } = yield* scripted((packet, socket) => {
           if (!("subscriptions" in packet)) return
 
           const qos = packet.subscriptions[0]?.qos ?? 0
@@ -298,7 +365,7 @@ describe("connect", () => {
   it("drops a connection whose broker stops answering PINGREQ", () =>
     run(
       Effect.gen(function* () {
-        const port = yield* scripted(() => {})
+        const { port } = yield* scripted(() => {})
         const client = yield* connect({ host, port, keepAlive: "1 second", reconnect: false })
         const closed = yield* client.statusChanges.pipe(Stream.filter(ConnectionStatus.$is("Closed")), Stream.take(1), Stream.runCollect)
 
@@ -309,7 +376,7 @@ describe("connect", () => {
   it("closes on a malformed packet from the broker", () =>
     run(
       Effect.gen(function* () {
-        const port = yield* scripted((_packet, socket) => socket.write(Buffer.from([0xf0, 0x00])))
+        const { port } = yield* scripted((_packet, socket) => socket.write(Buffer.from([0xf0, 0x00])))
         const client = yield* connect({ host, port, reconnect: false })
 
         yield* client.publish("t", "x")
@@ -325,7 +392,7 @@ describe("connect", () => {
       Effect.gen(function* () {
         const seen: Array<string> = []
 
-        const port = yield* scripted((packet, socket) => {
+        const { port } = yield* scripted((packet, socket) => {
           seen.push(packet._tag)
 
           if (seen.length > 1 || !("packetId" in packet)) return

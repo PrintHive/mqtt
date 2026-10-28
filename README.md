@@ -41,7 +41,7 @@ const program = Effect.gen(function* () {
 Effect.runPromise(Effect.scoped(program))
 ```
 
-The client stays connected until its scope closes. Closing the scope sends DISCONNECT, so the broker does not publish the client's will.
+The client stays connected until its scope closes, or until `client.close()`. Either one sends DISCONNECT, so the broker does not publish the client's will, and completes only once the socket is gone. A broker that does not hang up within `connectTimeout` has its socket destroyed. `client.close({ force: true })` destroys the socket at once without DISCONNECT, for a link already known to be dead; the broker then publishes the will.
 
 `subscribe` waits for the broker's SUBACK before it returns. Several subscriptions can share a filter; the broker holds one subscription for it, at the highest QoS any of them asked for. A message published after it returns is received, which matters for request and response protocols. The subscription lasts until the scope that created it closes.
 
