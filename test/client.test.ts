@@ -187,6 +187,82 @@ describe("connect", () => {
       })
     ))
 
+  it("keeps a confirmed subscription when a second one on the same filter is cancelled before its SUBACK", () =>
+    run(
+      Effect.gen(function* () {
+        const seen: Array<string> = []
+
+        const port = yield* scripted((packet, socket) => {
+          seen.push(packet._tag)
+
+          // Confirm only the first SUBSCRIBE, so the second stays pending.
+          if (seen.length === 1 && "packetId" in packet) socket.write(encode(P.suback(packet.packetId, [0])))
+        })
+
+        const client = yield* connect({ host, port })
+
+        yield* client.subscribe("t")
+
+        const pending = yield* Effect.forkChild(Effect.scoped(client.subscribe("t")), { startImmediately: true })
+
+        yield* Effect.sleep("50 millis")
+        yield* Fiber.interrupt(pending)
+        yield* Effect.sleep("50 millis")
+        expect(seen).toEqual(["Subscribe", "Subscribe"])
+      })
+    ))
+
+  it("keeps the highest QoS on a filter when a lower-QoS subscription joins it", () =>
+    run(
+      Effect.gen(function* () {
+        const { port } = yield* aedes()
+        const client = yield* connect({ host, port })
+        const high = yield* client.subscribe("t", { qos: 2 })
+
+        yield* client.subscribe("t", { qos: 0 })
+        yield* client.publish("t", "x", { qos: 2 })
+
+        expect((yield* high.pipe(Stream.take(1), Stream.runCollect)).map(summary)).toEqual([["t", "x", 2, false]])
+      })
+    ))
+
+  it("waits for the reconnect schedule before the first reconnect", () =>
+    run(
+      Effect.gen(function* () {
+        const { port, drop } = yield* aedes()
+        const client = yield* connect({ host, port, reconnect: Schedule.spaced("300 millis") })
+        const back = yield* Effect.forkChild(reconnected(client.statusChanges), { startImmediately: true })
+        const droppedAt = Date.now()
+
+        drop(client.clientId)
+        yield* Fiber.join(back)
+        expect(Date.now() - droppedAt).toBeGreaterThanOrEqual(250)
+      })
+    ))
+
+  it("never lets a full keep-alive period pass without sending a packet", () =>
+    run(
+      Effect.gen(function* () {
+        const { broker, port } = yield* aedes()
+        const sent: Array<number> = []
+
+        broker.on("ping", () => sent.push(Date.now()))
+        sent.push(Date.now())
+
+        const client = yield* connect({ host, port, keepAlive: "1 second" })
+
+        yield* Effect.sleep("600 millis")
+        yield* client.publish("t", "x")
+        sent.push(Date.now())
+        yield* Effect.sleep("2600 millis")
+
+        const gaps = sent.slice(1).map((t, i) => t - (sent[i] ?? t))
+
+        expect(sent.length).toBeGreaterThanOrEqual(4)
+        expect(Math.max(...gaps)).toBeLessThanOrEqual(1100)
+      })
+    ), 6000)
+
   it("drops a connection whose broker stops answering PINGREQ", () =>
     run(
       Effect.gen(function* () {

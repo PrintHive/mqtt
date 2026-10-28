@@ -86,6 +86,7 @@ export interface MqttClient {
 
 interface Subscriber {
   readonly filter: string
+  readonly qos: QoS
   readonly queue: Queue.Queue<Message, MqttError | Cause.Done>
 }
 
@@ -140,7 +141,8 @@ class Connection implements Link {
   private error: MqttError | undefined = undefined
   private corked = false
   private lastWrite = Date.now()
-  private pingOutstanding = false
+  /** When the unanswered PINGREQ went out, or undefined when none is outstanding. */
+  private pingSentAt: number | undefined = undefined
   private timer: ReturnType<typeof setInterval> | undefined = undefined
 
   constructor(socket: net.Socket, session: Session, onDrain: () => void) {
@@ -191,7 +193,7 @@ class Connection implements Link {
   }
 
   pong(): void {
-    this.pingOutstanding = false
+    this.pingSentAt = undefined
   }
 
   fail(error: MqttError): void {
@@ -200,20 +202,27 @@ class Connection implements Link {
   }
 
   /**
-   * Sends PINGREQ after a quiet keep-alive period, and drops the connection when the previous PINGREQ got no
-   * PINGRESP within one period (section 3.1.2.10).
+   * Keeps the gap between outgoing packets under one keep-alive period (section 3.1.2.10) and drops the connection
+   * when a PINGREQ gets no PINGRESP within one period. Checking every quarter period and pinging after three quarters
+   * of quiet sends the PINGREQ before the full period passes.
    */
   startKeepAlive(periodMs: number): void {
     if (periodMs === 0) return
 
     this.timer = setInterval(() => {
-      if (this.pingOutstanding) return this.fail(new ConnectionError({ message: "no PINGRESP within the keep-alive period" }))
+      const now = Date.now()
 
-      if (Date.now() - this.lastWrite >= periodMs / 2) {
-        this.pingOutstanding = true
+      if (this.pingSentAt !== undefined) {
+        if (now - this.pingSentAt >= periodMs) this.fail(new ConnectionError({ message: "no PINGRESP within the keep-alive period" }))
+
+        return
+      }
+
+      if (now - this.lastWrite >= (periodMs * 3) / 4) {
+        this.pingSentAt = now
         this.write(encode(P.pingreq))
       }
-    }, periodMs)
+    }, periodMs / 4)
     this.timer.unref()
   }
 
@@ -282,23 +291,29 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
     const config = configure(options)
     const clientScope = yield* Effect.scope
     const subscribers = new TopicTree<Subscriber>()
-    const live = new Set<Subscriber>()
-    /** Filters confirmed by SUBACK, with the QoS granted, for resubscribing when the broker loses the session. */
-    const confirmed = new Map<string, { qos: QoS; streams: number }>()
+    /** Live subscribers by filter. The broker holds one subscription per filter, at the highest QoS any of them asked for. */
+    const filters = new Map<string, Set<Subscriber>>()
+
+    const requested = (filter: string): QoS => {
+      let qos: QoS = 0
+
+      for (const s of filters.get(filter) ?? []) if (s.qos > qos) qos = s.qos
+
+      return qos
+    }
+
     const session = new Session((message) => subscribers.match(message.topic, (s) => Queue.offerUnsafe(s.queue, message)))
     const writable = yield* Latch.make(false)
     const status = yield* SubscriptionRef.make<ConnectionStatus>(ConnectionStatus.Connecting())
     const ready = yield* Deferred.make<void, MqttError>()
     let closed: ClientClosed | undefined = undefined
 
-    const failRejected = (filters: ReadonlyArray<string>, codes: ReadonlyArray<P.SubackCode>) =>
+    const failRejected = (rejected: ReadonlyArray<string>, codes: ReadonlyArray<P.SubackCode>) =>
       Effect.sync(() => {
-        filters.forEach((filter, i) => {
+        rejected.forEach((filter, i) => {
           if (codes[i] !== 0x80) return
 
-          confirmed.delete(filter)
-
-          for (const s of live) if (s.filter === filter) Queue.failCauseUnsafe(s.queue, Cause.fail(new SubscribeRejected({ filter })))
+          for (const s of filters.get(filter) ?? []) Queue.failCauseUnsafe(s.queue, Cause.fail(new SubscribeRejected({ filter })))
         })
       })
 
@@ -307,12 +322,12 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
 
       session.attach(connection, sessionPresent)
 
-      if (!sessionPresent && confirmed.size > 0) {
-        const filters = [...confirmed.keys()]
-        const resubscribe = session.subscribe(filters.map((filter) => ({ filter, qos: confirmed.get(filter)?.qos ?? 0 })))
+      if (!sessionPresent && filters.size > 0) {
+        const active = [...filters.keys()]
+        const resubscribe = session.subscribe(active.map((filter) => ({ filter, qos: requested(filter) })))
 
         // Starting immediately writes the SUBSCRIBE now, ahead of any publish waiting for the connection.
-        yield* Effect.forkScoped(Effect.flatMap(resubscribe, (codes) => failRejected(filters, codes)), { startImmediately: true })
+        yield* Effect.forkScoped(Effect.flatMap(resubscribe, (codes) => failRejected(active, codes)), { startImmediately: true })
       }
 
       writable.openUnsafe()
@@ -331,12 +346,22 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
       let lost = yield* run
 
       while (config.reconnect !== false) {
+        const dropped = lost
         let attempt = 0
+        let waited = false
 
-        yield* SubscriptionRef.set(status, ConnectionStatus.Reconnecting({ attempt, error: lost }))
-        lost = yield* run.pipe(
+        // The drop counts as the first failure, so the schedule's first delay comes before the first reconnect.
+        const attemptAfterDelay = Effect.suspend(() => {
+          if (waited) return run
+
+          waited = true
+
+          return Effect.fail(dropped)
+        })
+
+        lost = yield* attemptAfterDelay.pipe(
           Effect.tapError((error) => SubscriptionRef.set(status, ConnectionStatus.Reconnecting({ attempt: ++attempt, error }))),
-          Effect.retry({ schedule: config.reconnect, while: transient })
+          Effect.retry({ schedule: config.reconnect, while: (error) => error === dropped || transient(error) })
         )
       }
 
@@ -349,7 +374,7 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
         session.close(closed)
         writable.openUnsafe()
 
-        for (const s of live) Queue.failCauseUnsafe(s.queue, Cause.fail(error))
+        for (const set of filters.values()) for (const s of set) Queue.failCauseUnsafe(s.queue, Cause.fail(error))
 
         yield* SubscriptionRef.set(status, ConnectionStatus.Closed({ error }))
         yield* Deferred.fail(ready, error)
@@ -390,13 +415,14 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
     const release = (subscriber: Subscriber) =>
       Effect.suspend(() => {
         subscribers.remove(subscriber.filter, subscriber)
-        live.delete(subscriber)
 
-        const entry = confirmed.get(subscriber.filter)
+        const set = filters.get(subscriber.filter)
 
-        if (entry === undefined || --entry.streams > 0 || closed) return Effect.void
+        set?.delete(subscriber)
 
-        confirmed.delete(subscriber.filter)
+        if (set === undefined || set.size > 0 || closed) return Effect.void
+
+        filters.delete(subscriber.filter)
 
         return Effect.forkIn(Effect.ignore(session.unsubscribe([subscriber.filter])), clientScope)
       })
@@ -409,20 +435,18 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
 
           const qos = subscribeOptions?.qos ?? 0
           const queue = yield* Queue.unbounded<Message, MqttError | Cause.Done>()
-          const subscriber: Subscriber = { filter, queue }
+          const subscriber: Subscriber = { filter, qos, queue }
+          const set = filters.get(filter) ?? new Set()
 
           // Register before SUBSCRIBE goes out, so retained messages that race the SUBACK are kept.
+          filters.set(filter, set.add(subscriber))
           subscribers.add(filter, subscriber)
-          live.add(subscriber)
           yield* Effect.addFinalizer(() => release(subscriber))
 
-          const [code] = yield* session.subscribe([{ filter, qos }])
+          // SUBSCRIBE replaces the broker's subscription on an identical filter, QoS included (section 3.8.4).
+          const [code] = yield* session.subscribe([{ filter, qos: requested(filter) }])
 
           if (code === 0x80 || code === undefined) return yield* Effect.fail(new SubscribeRejected({ filter }))
-
-          const entry = confirmed.get(filter)
-
-          confirmed.set(filter, { qos: entry === undefined || code > entry.qos ? code : entry.qos, streams: (entry?.streams ?? 0) + 1 })
 
           return Stream.fromQueue(queue)
         })

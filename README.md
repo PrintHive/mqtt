@@ -43,7 +43,7 @@ Effect.runPromise(Effect.scoped(program))
 
 The client stays connected until its scope closes. Closing the scope sends DISCONNECT, so the broker does not publish the client's will.
 
-`subscribe` waits for the broker's SUBACK before it returns. A message published after it returns is received, which matters for request and response protocols. The subscription lasts until the scope that created it closes.
+`subscribe` waits for the broker's SUBACK before it returns. Several subscriptions can share a filter; the broker holds one subscription for it, at the highest QoS any of them asked for. A message published after it returns is received, which matters for request and response protocols. The subscription lasts until the scope that created it closes.
 
 ## Talk to a Bambu Lab printer
 
@@ -63,10 +63,10 @@ PRINTER_HOST=192.0.2.10 PRINTER_SERIAL=... PRINTER_ACCESS_CODE=... bun examples/
 | `clientId` | `printhive-` and 12 random hex digits | MQTT client identifier. |
 | `username`, `password` | none | Credentials. The password can be a string or bytes. |
 | `cleanSession` | `true` | With `false`, the broker keeps subscriptions and queued QoS 1 and 2 messages across reconnects. |
-| `keepAlive` | 60 seconds | The client sends PINGREQ after a quiet half period and drops a connection with no PINGRESP within one period. 0 turns it off. |
+| `keepAlive` | 60 seconds | The client sends PINGREQ after three quarters of a period without writes, so a full period never passes silently, and drops a connection with no PINGRESP within one period. 0 turns it off. |
 | `connectTimeout` | 10 seconds | Time allowed for the socket and CONNACK. |
 | `will` | none | `{ topic, payload, qos, retain }`, published by the broker if the client disappears without DISCONNECT. |
-| `reconnect` | exponential from 500 ms, capped at 30 s, forever | An Effect `Schedule` for retrying after an established connection drops. `false` closes the client on the first drop. |
+| `reconnect` | exponential from 500 ms, capped at 30 s, forever | An Effect `Schedule` for reconnecting after an established connection drops. Its first delay comes before the first attempt. `false` closes the client on the first drop. |
 
 The first connection is not retried, so `connect` fails fast when the broker is unreachable or refuses the credentials. Reconnecting stops early on a refusal that retrying cannot fix, such as bad credentials.
 
