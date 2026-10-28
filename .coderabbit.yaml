@@ -1,0 +1,22 @@
+language: en-US
+reviews:
+  profile: chill
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - "!bun.lock"
+    - "!tools/oxlint/anti-slop/**"
+  path_instructions:
+    - path: "**/*"
+      instructions: |
+        This repository is public. Flag any real credential, printer serial number, access code, hostname, or private IP committed in code, tests, fixtures, or docs.
+    - path: "src/**/*.ts"
+      instructions: |
+        This is an MQTT 3.1.1 client built on Effect 4. Check behavior against the OASIS MQTT 3.1.1 specification and cite its section. Modules are imported by subpath (effect/Effect), never the effect barrel. src/packet.ts, src/codec.ts, and src/session.ts are the per-packet hot path and deliberately use plain tagged objects and switch statements; flag allocations or Effect overhead added there. Everything else follows the anti-slop rules in oxlint.config.ts.
+    - path: "test/**"
+      instructions: |
+        Tests run against a real broker (aedes) or a scripted one built on the codec, never module mocks. Each test should fail if the behavior it names breaks.
+    - path: "bench/**"
+      instructions: |
+        Benchmarks must verify every message arrived and alternate the compared libraries run by run.
