@@ -19,6 +19,9 @@ export class SubscribeRejected extends Data.TaggedError("SubscribeRejected")<{ r
 /** A topic or filter breaks the rules in section 4.7. */
 export class InvalidTopic extends Data.TaggedError("InvalidTopic")<{ readonly topic: string }> {}
 
+/** An option is outside its allowed range. */
+export class InvalidOption extends Data.TaggedError("InvalidOption")<{ readonly option: string; readonly message: string }> {}
+
 /** The client's scope closed, or reconnecting gave up. */
 export class ClientClosed extends Data.TaggedError("ClientClosed")<{ readonly message: string }> {}
 
@@ -28,6 +31,7 @@ export type MqttError =
   | ProtocolError
   | SubscribeRejected
   | InvalidTopic
+  | InvalidOption
   | ClientClosed
   | MalformedPacket
 

@@ -9,6 +9,11 @@ import type { Packet, Publish, PublishAcknowledged, QoS, SubackCode, Subscriptio
 
 /** The open connection a session writes to. */
 export interface Link {
+  /**
+   * False once the socket has ended or been destroyed. A connection can fail a moment before the session detaches it,
+   * and a write in that moment goes nowhere.
+   */
+  readonly accepting: boolean
   /** Returns false when the socket buffer is full and the caller should wait for drain. */
   write(buf: Buffer): boolean
   pong(): void
@@ -24,6 +29,8 @@ type Stage = "Unacked" | "Released"
 interface InFlight {
   readonly packet: PublishAcknowledged
   stage: Stage
+  /** False until the PUBLISH reaches a socket. A caller interrupted before then gets a promise that nothing is sent. */
+  written: boolean
   readonly done: Deferred.Deferred<void, MqttError>
 }
 
@@ -65,10 +72,18 @@ export class Session {
       const done = Deferred.makeUnsafe<void, MqttError>()
       const packet = P.publishAcknowledged(topic, payload, qos, packetId, retain, false)
 
-      this.inFlight.set(packetId, { packet, stage: "Unacked", done })
-      this.link?.write(encode(packet))
+      const link = this.link?.accepting ? this.link : undefined
+      const f: InFlight = { packet, stage: "Unacked", written: link !== undefined, done }
 
-      return Deferred.await(done)
+      this.inFlight.set(packetId, f)
+      link?.write(encode(packet))
+
+      // Once written, the exchange must finish (section 4.4). Before that, an interrupted caller leaves nothing behind.
+      return Effect.onInterrupt(Deferred.await(done), () =>
+        Effect.sync(() => {
+          if (!f.written && this.inFlight.get(packetId) === f) this.inFlight.delete(packetId)
+        })
+      )
     })
   }
 
@@ -105,8 +120,12 @@ export class Session {
 
     if (!sessionPresent) this.received.clear()
 
+    // A link that failed between CONNACK and attach takes nothing, and nothing it was handed counts as written.
+    if (!link.accepting) return
+
     for (const [id, f] of this.inFlight) {
-      link.write(encode(f.stage === "Released" ? P.pubrel(id) : { ...f.packet, dup: true }))
+      link.write(encode(f.stage === "Released" ? P.pubrel(id) : { ...f.packet, dup: f.written }))
+      f.written = true
     }
 
     for (const r of this.requests.values()) link.write(encode(r.packet))

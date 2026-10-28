@@ -5,9 +5,10 @@ import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Schedule from "effect/Schedule"
 import * as Stream from "effect/Stream"
+import * as TestClock from "effect/testing/TestClock"
 import { describe, expect, it } from "vitest"
 import { encode } from "../src/codec.ts"
-import { ClientClosed, ConnectionError, ConnectionRefused, connect, ConnectionStatus, InvalidTopic, SubscribeRejected } from "../src/index.ts"
+import { ClientClosed, ConnectionError, ConnectionRefused, connect, ConnectionStatus, InvalidOption, InvalidTopic, SubscribeRejected } from "../src/index.ts"
 import type { Message } from "../src/index.ts"
 import * as P from "../src/packet.ts"
 import { aedes, closedPort, scripted, selfSigned } from "./brokers.ts"
@@ -158,6 +159,33 @@ describe("connect", () => {
         const [first] = yield* messages.pipe(Stream.take(1), Stream.runCollect)
 
         expect(first && summary(first)).toEqual(["jobs", "print", 1, false])
+      })
+    ))
+
+  it.each([0, 1] as const)("never sends a QoS %i publish whose caller was interrupted before it was written", (qos) =>
+    run(
+      Effect.gen(function* () {
+        const { port, drop } = yield* aedes()
+        const observer = yield* connect({ host, port })
+        const messages = yield* observer.subscribe("jobs", { qos: 1 })
+        const client = yield* connect({ host, port, reconnect: Schedule.spaced("300 millis") })
+
+        const reconnecting = yield* Effect.forkChild(
+          client.statusChanges.pipe(Stream.filter(ConnectionStatus.$is("Reconnecting")), Stream.take(1), Stream.runDrain),
+          { startImmediately: true }
+        )
+
+        const back = yield* Effect.forkChild(reconnected(client.statusChanges), { startImmediately: true })
+
+        drop(client.clientId)
+        yield* Fiber.join(reconnecting)
+
+        const abandoned = yield* Effect.forkChild(client.publish("jobs", "abandoned", { qos }), { startImmediately: true })
+
+        yield* Fiber.interrupt(abandoned)
+        yield* Fiber.join(back)
+        yield* client.publish("jobs", "after", { qos: 1 })
+        expect((yield* messages.pipe(Stream.take(1), Stream.runCollect)).map(summary)).toEqual([["jobs", "after", 1, false]])
       })
     ))
 
@@ -364,6 +392,143 @@ describe("connect", () => {
         expect(Math.max(...gaps)).toBeLessThanOrEqual(1100)
       })
     ), 6000)
+
+  describe("backpressure", () => {
+    const COUNT = 2000
+    const SIZE = 16_384
+
+    /**
+     * A broker that answers PINGREQ and confirms each SUBSCRIBE. After the `subscribes`th one, it writes 32 MB of
+     * numbered messages as fast as it can.
+     */
+    const flood = (subscribes: number) =>
+      Effect.gen(function* () {
+        const flooded = yield* Deferred.make<net.Socket>()
+        const pingreq = encode(P.pingreq)
+        let seen = 0
+
+        const { port } = yield* scripted((packet, socket) => {
+          if (Buffer.compare(encode(packet), pingreq) === 0) return void socket.write(encode(P.pingresp))
+
+          if (!("subscriptions" in packet)) return
+
+          socket.write(encode(P.suback(packet.packetId, [0])))
+
+          if (++seen < subscribes) return
+
+          for (let i = 0; i < COUNT; i++) {
+            const payload = Buffer.alloc(SIZE)
+
+            payload.writeUInt32BE(i)
+            socket.write(encode(P.publishAtMostOnce("flood", payload, false)))
+          }
+
+          Deferred.doneUnsafe(flooded, Effect.succeed(socket))
+        })
+
+        return { port, flooded }
+      })
+
+    const flooding = flood(1)
+
+    const inOrder = (messages: ReadonlyArray<Message>) => messages.every((m, i) => Buffer.from(m.payload).readUInt32BE(0) === i)
+
+    it("stops reading while a subscription is full, then delivers every message in order", () =>
+      run(
+        Effect.gen(function* () {
+          const { port, flooded } = yield* flooding
+          const client = yield* connect({ host, port })
+          const messages = yield* client.subscribe("flood", { bufferSize: 16 })
+          const broker = yield* Deferred.await(flooded)
+
+          yield* Effect.sleep("500 millis")
+
+          // A client still reading would drain the broker's queue within milliseconds on loopback. A paused one leaves
+          // it full and unchanged, so the bytes wait in the broker's socket instead of the client's memory.
+          const queued = broker.writableLength
+
+          yield* Effect.sleep("300 millis")
+          expect([queued > 0, broker.writableLength]).toEqual([true, queued])
+
+          const got = yield* messages.pipe(Stream.take(COUNT), Stream.runCollect)
+
+          expect(got.length).toBe(COUNT)
+          expect(inOrder(got)).toBe(true)
+          expect(broker.writableLength).toBe(0)
+        })
+      ), 15_000)
+
+    it("counts the chunk a slow consumer still holds against bufferSize", () =>
+      run(
+        Effect.gen(function* () {
+          const capacity = 256
+          const { port, flooded } = yield* flood(2)
+          const client = yield* connect({ host, port })
+          const slow = yield* client.subscribe("flood", { bufferSize: capacity })
+          // A second, fast subscriber on the same filter counts every message the client has read off the socket.
+          const counter = yield* client.subscribe("flood", { bufferSize: COUNT })
+          let read = 0
+
+          yield* Effect.forkChild(Stream.runForEach(counter, () => Effect.sync(() => void read++)), { startImmediately: true })
+          yield* Deferred.await(flooded)
+          yield* Effect.sleep("300 millis")
+
+          const whenFull = read
+
+          // The slow consumer arrives only once its buffer is full, takes one chunk, and never finishes it. Releasing
+          // that chunk on take would resume reading and let another bufferSize in.
+          yield* Effect.forkChild(Stream.runForEach(slow, () => Effect.never), { startImmediately: true })
+          yield* Effect.sleep("500 millis")
+          expect(whenFull).toBeGreaterThanOrEqual(capacity)
+          expect(read - whenFull).toBeLessThan(capacity / 2)
+        })
+      ), 15_000)
+
+    it("keeps the connection through keep-alive periods while paused", () =>
+      run(
+        Effect.gen(function* () {
+          const { port, flooded } = yield* flooding
+          const client = yield* connect({ host, port, keepAlive: "1 second", reconnect: false })
+          const messages = yield* client.subscribe("flood", { bufferSize: 1 })
+
+          yield* Deferred.await(flooded)
+          yield* Effect.sleep("3 seconds")
+          expect((yield* client.status)._tag).toBe("Connected")
+          expect((yield* messages.pipe(Stream.take(COUNT), Stream.runCollect)).length).toBe(COUNT)
+        })
+      ), 15_000)
+
+    it("rejects a bufferSize below 1", () =>
+      run(
+        Effect.gen(function* () {
+          const { port } = yield* aedes()
+          const client = yield* connect({ host, port })
+
+          expect(yield* Effect.flip(client.subscribe("t", { bufferSize: 0 }))).toBeInstanceOf(InvalidOption)
+        })
+      ))
+  })
+
+  it("runs keep-alive on Effect's Clock, so TestClock drives PINGREQ and the PINGRESP deadline", () =>
+    run(
+      Effect.gen(function* () {
+        const seen: Array<string> = []
+        const { port } = yield* scripted((packet) => void seen.push(packet._tag))
+        const client = yield* connect({ host, port, keepAlive: "60 seconds", reconnect: false })
+        // Virtual time moves the timers; socket I/O still needs a moment of real time.
+        const settle = Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 50)))
+
+        yield* TestClock.adjust("44 seconds")
+        yield* settle
+        expect(seen).toEqual([])
+        yield* TestClock.adjust("2 seconds")
+        yield* settle
+        expect(seen).toEqual(["Pingreq"])
+        yield* TestClock.adjust("60 seconds")
+        yield* settle
+        expect((yield* client.status)._tag).toBe("Closed")
+      }).pipe(Effect.provide(TestClock.layer()))
+    ))
 
   it("drops a connection whose broker stops answering PINGREQ", () =>
     run(
