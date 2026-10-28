@@ -7,7 +7,7 @@ import * as Schedule from "effect/Schedule"
 import * as Stream from "effect/Stream"
 import { describe, expect, it } from "vitest"
 import { encode } from "../src/codec.ts"
-import { ClientClosed, ConnectionError, ConnectionRefused, connect, ConnectionStatus, InvalidTopic, SubscribeRejected } from "../src/index.ts"
+import { ClientClosed, ConnectionError, ConnectionRefused, connect, ConnectionStatus, InvalidOption, InvalidTopic, SubscribeRejected } from "../src/index.ts"
 import type { Message } from "../src/index.ts"
 import * as P from "../src/packet.ts"
 import { aedes, closedPort, scripted, selfSigned } from "./brokers.ts"
@@ -364,6 +364,83 @@ describe("connect", () => {
         expect(Math.max(...gaps)).toBeLessThanOrEqual(1100)
       })
     ), 6000)
+
+  describe("backpressure", () => {
+    const COUNT = 2000
+    const SIZE = 16_384
+
+    /** A broker that answers PINGREQ, confirms SUBSCRIBE, then writes 32 MB of numbered messages as fast as it can. */
+    const flooding = Effect.gen(function* () {
+      const flooded = yield* Deferred.make<net.Socket>()
+      const pingreq = encode(P.pingreq)
+
+      const port = yield* scripted((packet, socket) => {
+        if (Buffer.compare(encode(packet), pingreq) === 0) return void socket.write(encode(P.pingresp))
+
+        if (!("subscriptions" in packet)) return
+
+        socket.write(encode(P.suback(packet.packetId, [0])))
+
+        for (let i = 0; i < COUNT; i++) {
+          const payload = Buffer.alloc(SIZE)
+
+          payload.writeUInt32BE(i)
+          socket.write(encode(P.publishAtMostOnce("flood", payload, false)))
+        }
+
+        Deferred.doneUnsafe(flooded, Effect.succeed(socket))
+      })
+
+      return { port, flooded }
+    })
+
+    const inOrder = (messages: ReadonlyArray<Message>) => messages.every((m, i) => Buffer.from(m.payload).readUInt32BE(0) === i)
+
+    it("stops reading while a subscription is full, then delivers every message in order", () =>
+      run(
+        Effect.gen(function* () {
+          const { port, flooded } = yield* flooding
+          const client = yield* connect({ host, port })
+          const messages = yield* client.subscribe("flood", { bufferSize: 16 })
+          const broker = yield* Deferred.await(flooded)
+
+          yield* Effect.sleep("500 millis")
+
+          // The client stopped reading, so bytes back up in the broker's socket instead of the client's memory.
+          expect(broker.writableLength).toBeGreaterThan(0)
+
+          const got = yield* messages.pipe(Stream.take(COUNT), Stream.runCollect)
+
+          expect(got.length).toBe(COUNT)
+          expect(inOrder(got)).toBe(true)
+          expect(broker.writableLength).toBe(0)
+        })
+      ), 15_000)
+
+    it("keeps the connection through keep-alive periods while paused", () =>
+      run(
+        Effect.gen(function* () {
+          const { port, flooded } = yield* flooding
+          const client = yield* connect({ host, port, keepAlive: "1 second", reconnect: false })
+          const messages = yield* client.subscribe("flood", { bufferSize: 1 })
+
+          yield* Deferred.await(flooded)
+          yield* Effect.sleep("3 seconds")
+          expect((yield* client.status)._tag).toBe("Connected")
+          expect((yield* messages.pipe(Stream.take(COUNT), Stream.runCollect)).length).toBe(COUNT)
+        })
+      ), 15_000)
+
+    it("rejects a bufferSize below 1", () =>
+      run(
+        Effect.gen(function* () {
+          const { port } = yield* aedes()
+          const client = yield* connect({ host, port })
+
+          expect(yield* Effect.flip(client.subscribe("t", { bufferSize: 0 }))).toBeInstanceOf(InvalidOption)
+        })
+      ))
+  })
 
   it("drops a connection whose broker stops answering PINGREQ", () =>
     run(

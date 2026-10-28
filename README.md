@@ -4,7 +4,7 @@ A fast MQTT 3.1.1 client for [Effect](https://effect.website), on Bun and Node.j
 
 - QoS 0, 1, and 2 in both directions, retained messages, wills, and TLS.
 - Reconnects with an Effect `Schedule`, resends unfinished QoS 1 and 2 messages, and resubscribes when the broker lost the session.
-- Subscriptions are scoped streams that stay open until their scope closes.
+- Subscriptions are scoped streams with bounded buffers. A slow consumer makes the client stop reading, so TCP pushes back on the broker instead of memory growing.
 - No runtime dependencies besides the `effect` peer dependency. It runs on `node:net` and `node:tls`, which Bun also implements.
 - About 4 times faster than mqtt.js at decoding packets, and 1.2 to 1.7 times its end-to-end QoS 0 throughput. See [Performance](#performance).
 
@@ -77,6 +77,16 @@ The first connection is not retried, so `connect` fails fast when the broker is 
 - QoS 0 completes once the packet is written. While the client is reconnecting, or the socket's buffer is full, it waits.
 - QoS 1 completes on PUBACK, and QoS 2 on PUBCOMP. A message whose connection drops is sent again with DUP set after the reconnect.
 
+## Slow consumers
+
+Each subscription holds up to `bufferSize` messages, 1024 by default:
+
+```ts
+const reports = yield* client.subscribe("device/+/report", { bufferSize: 64 })
+```
+
+When a subscription is full, the client stops reading from the socket. TCP then pushes back on the broker, which queues or drops messages according to its own limits. Reading resumes once every full subscription has drained to half. The client keeps sending PINGREQ while paused, so a slow consumer does not cost the connection. Messages already read when a buffer fills are kept, so a buffer can exceed `bufferSize` by one socket read's worth.
+
 ## Connection status
 
 `client.status` reads the current `ConnectionStatus`, and `client.statusChanges` is a stream of it. The status is one of:
@@ -97,6 +107,7 @@ Every error is a tagged error, so `Effect.catchTag` can handle each one.
 | `ConnectionRefused` | The broker refused CONNECT. `returnCode` holds its reason (section 3.2.2.3). |
 | `SubscribeRejected` | The broker answered SUBSCRIBE with 0x80 for the filter. |
 | `InvalidTopic` | A topic has wildcards, or a filter misplaces `#` or `+`. |
+| `InvalidOption` | An option is out of range, such as a `bufferSize` below 1. |
 | `MalformedPacket` | The broker sent bytes that are not valid MQTT 3.1.1. |
 | `ProtocolError` | The broker sent a packet a client must not receive. |
 | `ClientClosed` | The client's scope closed, or reconnecting gave up. |
@@ -122,7 +133,7 @@ Effect's tagged constructors and `Match` measured 4 to 6 times slower than plain
 ## Limits
 
 - MQTT 3.1.1 only. MQTT 5 is planned.
-- Each subscription buffers messages without a limit. A consumer that falls far behind uses memory instead of slowing the broker.
+- Backpressure pauses the whole connection, so one slow subscription delays every subscription on that client. Give a slow consumer its own client when the others must keep up.
 - With overlapping subscriptions, a broker may send a message once per matching filter. Each copy reaches every local stream whose filter matches.
 
 ## Develop

@@ -17,7 +17,7 @@ import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
 import { Decoder, encode, MalformedPacket } from "./codec.ts"
-import { ClientClosed, ConnectionError, ConnectionRefused, InvalidTopic, ProtocolError, refused, SubscribeRejected } from "./errors.ts"
+import { ClientClosed, ConnectionError, ConnectionRefused, InvalidOption, InvalidTopic, ProtocolError, refused, SubscribeRejected } from "./errors.ts"
 import type { MqttError } from "./errors.ts"
 import * as P from "./packet.ts"
 import type { Publish, QoS, Will } from "./packet.ts"
@@ -64,6 +64,14 @@ export interface PublishOptions {
 export interface SubscribeOptions {
   /** The highest QoS to receive at. Defaults to 0. */
   readonly qos?: QoS | undefined
+  /**
+   * Messages this subscription holds before the client stops reading from the broker. Defaults to 1024.
+   *
+   * While any subscription is full, the client reads nothing, so TCP pushes back on the broker; reading resumes once
+   * every full subscription has drained to half. Messages already read when a buffer fills are kept, so a buffer can
+   * exceed this by one socket read's worth.
+   */
+  readonly bufferSize?: number | undefined
 }
 
 /** A received message. `payload` is a view into the socket buffer it arrived in. */
@@ -100,8 +108,11 @@ export interface MqttClient {
 interface Subscriber {
   readonly filter: string
   readonly qos: QoS
+  readonly capacity: number
   readonly queue: Queue.Queue<Message, MqttError | Cause.Done>
 }
+
+const DEFAULT_BUFFER_SIZE = 1024
 
 interface Config {
   readonly host: string
@@ -158,6 +169,7 @@ class Connection implements Link {
   private lastWrite = Date.now()
   /** When the unanswered PINGREQ went out, or undefined when none is outstanding. */
   private pingSentAt: number | undefined = undefined
+  private reading = true
   private timer: ReturnType<typeof setInterval> | undefined = undefined
 
   constructor(socket: net.Socket, session: Session, onDrain: () => void) {
@@ -211,6 +223,18 @@ class Connection implements Link {
     this.pingSentAt = undefined
   }
 
+  /** Stops or resumes reading from the socket, which is how the client pushes back on the broker. */
+  setReading(reading: boolean): void {
+    if (reading === this.reading) return
+
+    this.reading = reading
+    // A PINGRESP may be sitting unread in the socket, so the wait for it starts over on resume.
+    this.pingSentAt = undefined
+
+    if (reading) this.socket.resume()
+    else this.socket.pause()
+  }
+
   fail(error: MqttError): void {
     this.error ??= error
     this.socket.destroy()
@@ -226,6 +250,13 @@ class Connection implements Link {
 
     this.timer = setInterval(() => {
       const now = Date.now()
+
+      // While paused, keep pinging so the broker keeps the connection, but a PINGRESP cannot be read yet.
+      if (!this.reading) {
+        if (now - this.lastWrite >= (periodMs * 3) / 4) this.write(encode(P.pingreq))
+
+        return
+      }
 
       if (this.pingSentAt !== undefined) {
         if (now - this.pingSentAt >= periodMs) this.fail(new ConnectionError({ message: "no PINGRESP within the keep-alive period" }))
@@ -351,7 +382,29 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
       return qos
     }
 
-    const session = new Session((message) => subscribers.match(message.topic, (s) => Queue.offerUnsafe(s.queue, message)))
+    /** Subscribers at capacity. While any are, the client reads nothing from the broker. */
+    const full = new Set<Subscriber>()
+    let current: Connection | undefined = undefined
+
+    const deliver = (s: Subscriber, message: Message) => {
+      Queue.offerUnsafe(s.queue, message)
+
+      if (full.has(s) || Queue.sizeUnsafe(s.queue) < s.capacity) return
+
+      full.add(s)
+      current?.setReading(false)
+    }
+
+    /** Called after a subscriber's stream takes messages, and when it leaves. */
+    const drained = (s: Subscriber) => {
+      if (!full.has(s) || Queue.sizeUnsafe(s.queue) > s.capacity / 2) return
+
+      full.delete(s)
+
+      if (full.size === 0) current?.setReading(true)
+    }
+
+    const session = new Session((message) => subscribers.match(message.topic, (s) => deliver(s, message)))
     const writable = yield* Latch.make(false)
     const status = yield* SubscriptionRef.make<ConnectionStatus>(ConnectionStatus.Connecting())
     const ready = yield* Deferred.make<void, MqttError>()
@@ -370,6 +423,8 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
     const run = Effect.gen(function* () {
       const { connection, sessionPresent } = yield* establish(config, session, () => writable.openUnsafe(), () => force)
 
+      current = connection
+      connection.setReading(full.size === 0)
       session.attach(connection, sessionPresent)
 
       if (!sessionPresent && filters.size > 0) {
@@ -386,6 +441,7 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
 
       const error = yield* Deferred.await(connection.lost)
 
+      current = undefined
       writable.closeUnsafe()
       session.detach()
 
@@ -471,6 +527,8 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
       Effect.suspend(() => {
         subscribers.remove(subscriber.filter, subscriber)
 
+        if (full.delete(subscriber) && full.size === 0) current?.setReading(true)
+
         const set = filters.get(subscriber.filter)
 
         set?.delete(subscriber)
@@ -489,8 +547,15 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
           if (closed) return yield* Effect.fail(closed)
 
           const qos = subscribeOptions?.qos ?? 0
+          const capacity = subscribeOptions?.bufferSize ?? DEFAULT_BUFFER_SIZE
+
+          if (!Number.isInteger(capacity) || capacity < 1) {
+            return yield* Effect.fail(new InvalidOption({ option: "bufferSize", message: `bufferSize must be a whole number of at least 1, got ${capacity}` }))
+          }
+
+          // Unbounded underneath: the bound is enforced by pausing the socket, so a message already read is never dropped.
           const queue = yield* Queue.unbounded<Message, MqttError | Cause.Done>()
-          const subscriber: Subscriber = { filter, qos, queue }
+          const subscriber: Subscriber = { filter, qos, capacity, queue }
           const set = filters.get(filter) ?? new Set()
 
           // Register before SUBSCRIBE goes out, so retained messages that race the SUBACK are kept.
@@ -508,7 +573,13 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
             return yield* Effect.fail(new SubscribeRejected({ filter }))
           }
 
-          return Stream.fromQueue(queue)
+          return Stream.fromQueue(queue).pipe(
+            Stream.mapArray((messages) => {
+              drained(subscriber)
+
+              return messages
+            })
+          )
         })
 
     return {
