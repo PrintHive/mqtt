@@ -10,7 +10,7 @@ reviews:
   path_instructions:
     - path: "**/*"
       instructions: |
-        This repository is public. Flag any real credential, printer serial number, access code, hostname, or private IP committed in code, tests, fixtures, or docs.
+        This repository is public. Flag any real credential, printer serial number, access code, hostname, or private IP committed in code, tests, fixtures, or docs. The self-signed key and certificate in test/fixtures/test-only-*.pem are intentional; they exist only for the TLS tests.
     - path: "src/**/*.ts"
       instructions: |
         This is an MQTT 3.1.1 client built on Effect 4. Check behavior against the OASIS MQTT 3.1.1 specification and cite its section. Modules are imported by subpath (effect/Effect), never the effect barrel. src/packet.ts, src/codec.ts, and src/session.ts are the per-packet hot path and deliberately use plain tagged objects and switch statements; flag allocations or Effect overhead added there. Everything else follows the anti-slop rules in oxlint.config.ts.
