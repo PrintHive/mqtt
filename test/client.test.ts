@@ -524,23 +524,39 @@ describe("connect", () => {
           const { port, flooded } = yield* flood(2)
           const client = yield* connect({ host, port })
           const latest = yield* client.subscribe("flood", { bufferSize: 4, overflow: "dropOldest" })
-          const counter = yield* client.subscribe("flood", { bufferSize: COUNT })
+          const counter = yield* client.subscribe("flood", { bufferSize: COUNT * 2 })
+          const stalled = yield* Deferred.make<void>()
           const gate = yield* Deferred.make<void>()
           const seen: Array<number> = []
 
-          // The consumer stalls on its first message for the whole flood.
+          const broker = yield* Deferred.await(flooded)
+          yield* counter.pipe(Stream.take(COUNT), Stream.runDrain)
+
+          // The queue now holds the last 4 messages. The consumer stalls on the first; a chunked pull would also have
+          // taken the other 3 into its hands.
           const consumer = yield* latest.pipe(
             Stream.take(5),
-            Stream.runForEach((m) => Effect.suspend(() => (seen.push(index(m)) === 1 ? Deferred.await(gate) : Effect.void))),
+            Stream.runForEach((m) =>
+              Effect.suspend(() => (seen.push(index(m)) === 1 ? Effect.andThen(Deferred.succeed(stalled, undefined), Deferred.await(gate)) : Effect.void))
+            ),
             Effect.forkChild({ startImmediately: true })
           )
 
-          yield* Deferred.await(flooded)
-          yield* counter.pipe(Stream.take(COUNT), Stream.runDrain)
+          yield* Deferred.await(stalled)
+
+          // 4 newer messages slide the 3 left in the queue out.
+          for (let i = COUNT; i < COUNT + 4; i++) {
+            const payload = Buffer.alloc(4)
+
+            payload.writeUInt32BE(i)
+            broker.write(encode(P.publishAtMostOnce("flood", payload, false)))
+          }
+
+          yield* counter.pipe(Stream.take(4), Stream.runDrain)
           yield* Deferred.succeed(gate, undefined)
           yield* Fiber.join(consumer)
 
-          expect(seen.slice(1)).toEqual([COUNT - 4, COUNT - 3, COUNT - 2, COUNT - 1])
+          expect(seen).toEqual([COUNT - 4, COUNT, COUNT + 1, COUNT + 2, COUNT + 3])
         })
       ), 15_000)
 

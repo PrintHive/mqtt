@@ -27,7 +27,7 @@ import * as Stream from "effect/Stream"
 import { connect } from "@printhive/mqtt"
 
 const program = Effect.gen(function* () {
-  const client = yield* connect({ host: "broker.emqx.io", tls: true })
+  const client = yield* connect({ host: "broker.example.com", tls: true }) // your broker
   const messages = yield* client.subscribe("printers/+/status", { qos: 1 })
 
   yield* client.publish("printers/p1s/status", "printing", { qos: 1 })
@@ -94,7 +94,7 @@ When only the newest messages matter, such as a printer's status reports, set `o
 const latest = yield* client.subscribe("device/+/report", { bufferSize: 1, overflow: "dropOldest" })
 ```
 
-Such a subscription keeps the latest `bufferSize` unread messages and drops older ones. Its stream hands them out one at a time, so a consumer that falls behind resumes at the newest messages rather than a stale batch. It never pauses the client, so other subscriptions keep flowing. A dropped QoS 1 or 2 message has already been acknowledged to the broker, which does not resend it.
+Such a subscription keeps the latest `bufferSize` unread messages and drops older ones. Its stream hands them out one at a time, so a consumer that falls behind resumes at the newest messages rather than a stale batch. It never pauses the client, so other subscriptions keep flowing. The client acknowledges a QoS 1 or 2 message when it arrives, before the queue can drop it, and a broker that receives that acknowledgement does not resend the message. If the connection drops before the acknowledgement reaches the broker, a persistent session (`cleanSession: false`) may deliver it again.
 
 ## Connection status
 
