@@ -94,7 +94,7 @@ When only the newest messages matter, such as a printer's status reports, set `o
 const latest = yield* client.subscribe("device/+/report", { bufferSize: 1, overflow: "dropOldest" })
 ```
 
-Such a subscription keeps the latest `bufferSize` unread messages and drops older ones. It never pauses the client, so other subscriptions keep flowing. A dropped QoS 1 or 2 message has already been acknowledged to the broker, which does not resend it.
+Such a subscription keeps the latest `bufferSize` unread messages and drops older ones. Its stream hands them out one at a time, so a consumer that falls behind resumes at the newest messages rather than a stale batch. It never pauses the client, so other subscriptions keep flowing. A dropped QoS 1 or 2 message has already been acknowledged to the broker, which does not resend it.
 
 ## Connection status
 

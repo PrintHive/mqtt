@@ -503,21 +503,44 @@ describe("connect", () => {
     it("keeps only the latest bufferSize messages with dropOldest, without pausing the client", () =>
       run(
         Effect.gen(function* () {
-          const { port, flooded } = yield* flooding
+          const { port, flooded } = yield* flood(2)
           const client = yield* connect({ host, port })
-          const messages = yield* client.subscribe("flood", { bufferSize: 16, overflow: "dropOldest" })
-          const broker = yield* Deferred.await(flooded)
+          const latest = yield* client.subscribe("flood", { bufferSize: 16, overflow: "dropOldest" })
+          // Delivery to every matching subscriber is synchronous, so once this one has the whole flood, so does latest.
+          const counter = yield* client.subscribe("flood", { bufferSize: COUNT })
 
-          // Nothing consumes the stream, yet the client reads the whole flood off the socket.
-          yield* Effect.sync(() => broker.writableLength).pipe(
-            Effect.repeat({ until: (n) => n === 0, schedule: Schedule.spaced("20 millis") }),
-            Effect.timeout("5 seconds")
-          )
-          yield* Effect.sleep("200 millis")
+          yield* Deferred.await(flooded)
+          yield* counter.pipe(Stream.take(COUNT), Stream.runDrain)
 
-          const got = yield* messages.pipe(Stream.take(16), Stream.runCollect)
+          const got = yield* latest.pipe(Stream.take(16), Stream.runCollect)
 
           expect(got.map(index)).toEqual(Array.from({ length: 16 }, (_, i) => COUNT - 16 + i))
+        })
+      ), 15_000)
+
+    it("gives a slow dropOldest consumer the latest messages when it comes back, not a stale chunk", () =>
+      run(
+        Effect.gen(function* () {
+          const { port, flooded } = yield* flood(2)
+          const client = yield* connect({ host, port })
+          const latest = yield* client.subscribe("flood", { bufferSize: 4, overflow: "dropOldest" })
+          const counter = yield* client.subscribe("flood", { bufferSize: COUNT })
+          const gate = yield* Deferred.make<void>()
+          const seen: Array<number> = []
+
+          // The consumer stalls on its first message for the whole flood.
+          const consumer = yield* latest.pipe(
+            Stream.take(5),
+            Stream.runForEach((m) => Effect.suspend(() => (seen.push(index(m)) === 1 ? Deferred.await(gate) : Effect.void))),
+            Effect.forkChild({ startImmediately: true })
+          )
+
+          yield* Deferred.await(flooded)
+          yield* counter.pipe(Stream.take(COUNT), Stream.runDrain)
+          yield* Deferred.succeed(gate, undefined)
+          yield* Fiber.join(consumer)
+
+          expect(seen.slice(1)).toEqual([COUNT - 4, COUNT - 3, COUNT - 2, COUNT - 1])
         })
       ), 15_000)
 

@@ -611,7 +611,9 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
             subscriber.held = 0
             drained(subscriber)
 
-            return Effect.flatMap(Queue.takeBetween(queue, 1, capacity), (messages) => {
+            // A dropOldest consumer takes one message at a time. A larger chunk would go stale in its hands while newer
+            // messages slide through the queue behind it.
+            return Effect.flatMap(Queue.takeBetween(queue, 1, overflow === "dropOldest" ? 1 : capacity), (messages) => {
               subscriber.held = messages.length
 
               // takeBetween waits for at least one message, so the empty branch never runs.
