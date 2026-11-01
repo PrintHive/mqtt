@@ -27,7 +27,7 @@ import * as Stream from "effect/Stream"
 import { connect } from "@printhive/mqtt"
 
 const program = Effect.gen(function* () {
-  const client = yield* connect({ host: "broker.emqx.io", tls: true })
+  const client = yield* connect({ host: "broker.example.com", tls: true }) // your broker
   const messages = yield* client.subscribe("printers/+/status", { qos: 1 })
 
   yield* client.publish("printers/p1s/status", "printing", { qos: 1 })
@@ -88,6 +88,14 @@ const reports = yield* client.subscribe("device/+/report", { bufferSize: 64 })
 
 When a subscription is full, the client stops reading from the socket. TCP then pushes back on the broker, which queues or drops messages according to its own limits. Reading resumes once every full subscription has drained to half. The client keeps sending PINGREQ while paused, so a slow consumer does not cost the connection. It cannot read the PINGRESP until it resumes, though. A dead host or network still fails those PINGREQ writes at the TCP level, but a broker that stops answering while keeping its TCP connection open is detected only once the consumer catches up and reading resumes. Messages already read when a buffer fills are kept, so a buffer can exceed `bufferSize` by one socket read's worth.
 
+When only the newest messages matter, such as a printer's status reports, set `overflow: "dropOldest"`:
+
+```ts
+const latest = yield* client.subscribe("device/+/report", { bufferSize: 1, overflow: "dropOldest" })
+```
+
+Such a subscription keeps the latest `bufferSize` unread messages and drops older ones. Its stream hands them out one at a time, so a consumer that falls behind resumes at the newest messages rather than a stale batch. It never pauses the client, so other subscriptions keep flowing. The client acknowledges a QoS 1 or 2 message when it arrives, before the queue can drop it, and a broker that receives that acknowledgement does not resend the message. If the connection drops before the acknowledgement reaches the broker, a persistent session (`cleanSession: false`) may deliver it again.
+
 ## Connection status
 
 `client.status` reads the current `ConnectionStatus`, and `client.statusChanges` is a stream of it. The status is one of:
@@ -108,7 +116,7 @@ Every error is a tagged error, so `Effect.catchTag` can handle each one.
 | `ConnectionRefused` | The broker refused CONNECT. `returnCode` holds its reason (section 3.2.2.3). |
 | `SubscribeRejected` | The broker answered SUBSCRIBE with 0x80 for the filter. |
 | `InvalidTopic` | A topic has wildcards, or a filter misplaces `#` or `+`. |
-| `InvalidOption` | An option is out of range, such as a `bufferSize` below 1. |
+| `InvalidOption` | An option is out of range, such as a `bufferSize` below 1 or an unknown `overflow`. |
 | `MalformedPacket` | The broker sent bytes that are not valid MQTT 3.1.1. |
 | `ProtocolError` | The broker sent a packet a client must not receive. |
 | `ClientClosed` | The client's scope closed, or reconnecting gave up. |

@@ -9,7 +9,7 @@ import * as TestClock from "effect/testing/TestClock"
 import { describe, expect, it } from "vitest"
 import { encode } from "../src/codec.ts"
 import { ClientClosed, ConnectionError, ConnectionRefused, connect, ConnectionStatus, InvalidOption, InvalidTopic, SubscribeRejected } from "../src/index.ts"
-import type { Message } from "../src/index.ts"
+import type { Message, Overflow } from "../src/index.ts"
 import * as P from "../src/packet.ts"
 import { aedes, closedPort, scripted, selfSigned } from "./brokers.ts"
 
@@ -497,6 +497,97 @@ describe("connect", () => {
           expect((yield* messages.pipe(Stream.take(COUNT), Stream.runCollect)).length).toBe(COUNT)
         })
       ), 15_000)
+
+    const index = (m: Message) => Buffer.from(m.payload).readUInt32BE(0)
+
+    it("keeps only the latest bufferSize messages with dropOldest, without pausing the client", () =>
+      run(
+        Effect.gen(function* () {
+          const { port, flooded } = yield* flood(2)
+          const client = yield* connect({ host, port })
+          const latest = yield* client.subscribe("flood", { bufferSize: 16, overflow: "dropOldest" })
+          // Delivery to every matching subscriber is synchronous, so once this one has the whole flood, so does latest.
+          const counter = yield* client.subscribe("flood", { bufferSize: COUNT })
+
+          yield* Deferred.await(flooded)
+          yield* counter.pipe(Stream.take(COUNT), Stream.runDrain)
+
+          const got = yield* latest.pipe(Stream.take(16), Stream.runCollect)
+
+          expect(got.map(index)).toEqual(Array.from({ length: 16 }, (_, i) => COUNT - 16 + i))
+        })
+      ), 15_000)
+
+    it("gives a slow dropOldest consumer the latest messages when it comes back, not a stale chunk", () =>
+      run(
+        Effect.gen(function* () {
+          const { port, flooded } = yield* flood(2)
+          const client = yield* connect({ host, port })
+          const latest = yield* client.subscribe("flood", { bufferSize: 4, overflow: "dropOldest" })
+          const counter = yield* client.subscribe("flood", { bufferSize: COUNT * 2 })
+          const stalled = yield* Deferred.make<void>()
+          const gate = yield* Deferred.make<void>()
+          const seen: Array<number> = []
+
+          const broker = yield* Deferred.await(flooded)
+          yield* counter.pipe(Stream.take(COUNT), Stream.runDrain)
+
+          // The queue now holds the last 4 messages. The consumer stalls on the first; a chunked pull would also have
+          // taken the other 3 into its hands.
+          const consumer = yield* latest.pipe(
+            Stream.take(5),
+            Stream.runForEach((m) =>
+              Effect.suspend(() => (seen.push(index(m)) === 1 ? Effect.andThen(Deferred.succeed(stalled, undefined), Deferred.await(gate)) : Effect.void))
+            ),
+            Effect.forkChild({ startImmediately: true })
+          )
+
+          yield* Deferred.await(stalled)
+
+          // 4 newer messages slide the 3 left in the queue out.
+          for (let i = COUNT; i < COUNT + 4; i++) {
+            const payload = Buffer.alloc(4)
+
+            payload.writeUInt32BE(i)
+            broker.write(encode(P.publishAtMostOnce("flood", payload, false)))
+          }
+
+          yield* counter.pipe(Stream.take(4), Stream.runDrain)
+          yield* Deferred.succeed(gate, undefined)
+          yield* Fiber.join(consumer)
+
+          expect(seen).toEqual([COUNT - 4, COUNT, COUNT + 1, COUNT + 2, COUNT + 3])
+        })
+      ), 15_000)
+
+    it("does not let an unread dropOldest subscription hold back a backpressure one", () =>
+      run(
+        Effect.gen(function* () {
+          const { port, flooded } = yield* flood(2)
+          const client = yield* connect({ host, port })
+          yield* client.subscribe("flood", { bufferSize: 1, overflow: "dropOldest" })
+          const messages = yield* client.subscribe("flood", { bufferSize: 16 })
+
+          yield* Deferred.await(flooded)
+
+          const got = yield* messages.pipe(Stream.take(COUNT), Stream.runCollect)
+
+          expect(got.length).toBe(COUNT)
+          expect(inOrder(got)).toBe(true)
+        })
+      ), 15_000)
+
+    it("rejects an unknown overflow", () =>
+      run(
+        Effect.gen(function* () {
+          const { port } = yield* aedes()
+          const client = yield* connect({ host, port })
+          // SAFETY: deliberately not an Overflow; the test covers a caller without type checking.
+          const overflow = JSON.parse('"dropNewest"') as Overflow
+
+          expect(yield* Effect.flip(client.subscribe("t", { overflow }))).toBeInstanceOf(InvalidOption)
+        })
+      ))
 
     it("rejects a bufferSize below 1", () =>
       run(
