@@ -67,14 +67,23 @@ export interface SubscribeOptions {
   /** The highest QoS to receive at. Defaults to 0. */
   readonly qos?: QoS | undefined
   /**
-   * Messages this subscription holds before the client stops reading from the broker. Defaults to 1024.
-   *
-   * While any subscription is full, the client reads nothing, so TCP pushes back on the broker; reading resumes once
-   * every full subscription has drained to half. Messages already read when a buffer fills are kept, so a buffer can
-   * exceed this by one socket read's worth.
+   * Messages this subscription holds unread. Defaults to 1024. What happens when it is full depends on `overflow`.
    */
   readonly bufferSize?: number | undefined
+  /**
+   * What a full subscription does. Defaults to `"backpressure"`.
+   *
+   * - `"backpressure"`: the client reads nothing while any subscription is full, so TCP pushes back on the broker;
+   *   reading resumes once every full subscription has drained to half. Every message is delivered. Messages already
+   *   read when a buffer fills are kept, so a buffer can exceed `bufferSize` by one socket read's worth.
+   * - `"dropOldest"`: the subscription keeps only the latest `bufferSize` unread messages and drops older ones. It never
+   *   pauses the client, so a slow consumer here does not hold back other subscriptions. A dropped QoS 1 or 2 message
+   *   has already been acknowledged, so the broker does not resend it.
+   */
+  readonly overflow?: Overflow | undefined
 }
+
+export type Overflow = "backpressure" | "dropOldest"
 
 /** A received message. `payload` is a view into the socket buffer it arrived in. */
 export type Message = Publish
@@ -111,6 +120,7 @@ interface Subscriber {
   readonly filter: string
   readonly qos: QoS
   readonly capacity: number
+  readonly overflow: Overflow
   readonly queue: Queue.Queue<Message, MqttError | Cause.Done>
   /** Messages the consumer took in its last pull and may still be working through. They count against `capacity`. */
   held: number
@@ -402,7 +412,7 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
     const deliver = (s: Subscriber, message: Message) => {
       Queue.offerUnsafe(s.queue, message)
 
-      if (full.has(s) || buffered(s) < s.capacity) return
+      if (s.overflow === "dropOldest" || full.has(s) || buffered(s) < s.capacity) return
 
       full.add(s)
       current?.setReading(false)
@@ -561,14 +571,23 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
 
           const qos = subscribeOptions?.qos ?? 0
           const capacity = subscribeOptions?.bufferSize ?? DEFAULT_BUFFER_SIZE
+          const overflow = subscribeOptions?.overflow ?? "backpressure"
 
           if (!Number.isInteger(capacity) || capacity < 1) {
             return yield* Effect.fail(new InvalidOption({ option: "bufferSize", message: `bufferSize must be a whole number of at least 1, got ${capacity}` }))
           }
 
-          // Unbounded underneath: the bound is enforced by pausing the socket, so a message already read is never dropped.
-          const queue = yield* Queue.unbounded<Message, MqttError | Cause.Done>()
-          const subscriber: Subscriber = { filter, qos, capacity, queue, held: 0 }
+          if (overflow !== "backpressure" && overflow !== "dropOldest") {
+            return yield* Effect.fail(new InvalidOption({ option: "overflow", message: `overflow must be "backpressure" or "dropOldest", got ${String(overflow)}` }))
+          }
+
+          // With backpressure the queue is unbounded and the bound is enforced by pausing the socket, so a message already
+          // read is never dropped. With dropOldest a sliding queue enforces it.
+          const queue = yield* (overflow === "dropOldest"
+            ? Queue.sliding<Message, MqttError | Cause.Done>(capacity)
+            : Queue.unbounded<Message, MqttError | Cause.Done>())
+
+          const subscriber: Subscriber = { filter, qos, capacity, overflow, queue, held: 0 }
           const set = filters.get(filter) ?? new Set()
 
           // Register before SUBSCRIBE goes out, so retained messages that race the SUBACK are kept.
