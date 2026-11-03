@@ -8,7 +8,7 @@ import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import { describe, expect, it } from "vitest"
 import { encode } from "../src/codec.ts"
-import { ClientClosed, ConnectionError, ConnectionRefused, connect, ConnectionStatus, InvalidOption, InvalidTopic, SubscribeRejected } from "../src/index.ts"
+import { ClientClosed, ConnectionError, ConnectionRefused, connect, ConnectionStatus, InvalidOption, InvalidTopic, SubscribeRejected, SubscriptionStalled } from "../src/index.ts"
 import type { Message, Overflow } from "../src/index.ts"
 import * as P from "../src/packet.ts"
 import { aedes, closedPort, scripted, selfSigned } from "./brokers.ts"
@@ -295,6 +295,21 @@ describe("connect", () => {
       })
     ))
 
+  it("does not unsubscribe a filter that was subscribed again before the UNSUBSCRIBE went out", () =>
+    run(
+      Effect.gen(function* () {
+        const { port } = yield* aedes()
+        const client = yield* connect({ host, port })
+
+        yield* Effect.scoped(client.subscribe("x/y"))
+
+        const messages = yield* client.subscribe("x/y")
+
+        yield* client.publish("x/y", "still here", { qos: 1 })
+        expect((yield* messages.pipe(Stream.take(1), Stream.runCollect)).map(summary)).toEqual([["x/y", "still here", 0, false]])
+      })
+    ), 5000)
+
   it("keeps a confirmed subscription when a second one on the same filter is cancelled before its SUBACK", () =>
     run(
       Effect.gen(function* () {
@@ -576,6 +591,57 @@ describe("connect", () => {
           expect(inOrder(got)).toBe(true)
         })
       ), 15_000)
+
+    it("drops a subscription that stays full past maxPaused, and resumes reading for the others", () =>
+      run(
+        Effect.gen(function* () {
+          const { port, flooded } = yield* flood(2)
+          const client = yield* connect({ host, port, maxPaused: "300 millis" })
+          const stuck = yield* client.subscribe("flood", { bufferSize: 16 })
+          const others = yield* client.subscribe("flood", { bufferSize: 16 })
+
+          yield* Deferred.await(flooded)
+
+          // Nobody reads stuck, so it pauses the client until maxPaused drops it; then others gets the whole flood.
+          const got = yield* others.pipe(Stream.take(COUNT), Stream.runCollect)
+          const error = yield* Effect.flip(Stream.runDrain(stuck))
+
+          expect(got.length).toBe(COUNT)
+          expect(inOrder(got)).toBe(true)
+          expect(error).toBeInstanceOf(SubscriptionStalled)
+          expect(error).toMatchObject({ filter: "flood" })
+        })
+      ), 15_000)
+
+    it("restarts the maxPaused clock each time a subscription fills up again", () =>
+      run(
+        Effect.gen(function* () {
+          const { port, flooded } = yield* flooding
+          const client = yield* connect({ host, port, maxPaused: "500 millis" })
+          const messages = yield* client.subscribe("flood", { bufferSize: 16 })
+
+          yield* Deferred.await(flooded)
+
+          // Each stall is under maxPaused, but together they are well past it.
+          const got = yield* messages.pipe(
+            Stream.take(COUNT),
+            Stream.tap((m) => (index(m) % 400 === 0 && index(m) < 2000 ? Effect.sleep("300 millis") : Effect.void)),
+            Stream.runCollect
+          )
+
+          expect(got.length).toBe(COUNT)
+          expect(inOrder(got)).toBe(true)
+        })
+      ), 15_000)
+
+    it("rejects a maxPaused that is not positive", () =>
+      run(
+        Effect.gen(function* () {
+          const { port } = yield* aedes()
+
+          expect(yield* Effect.flip(connect({ host, port, maxPaused: 0 }))).toBeInstanceOf(InvalidOption)
+        })
+      ))
 
     it("rejects an unknown overflow", () =>
       run(

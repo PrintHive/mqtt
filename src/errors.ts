@@ -16,6 +16,12 @@ export class ProtocolError extends Data.TaggedError("ProtocolError")<{ readonly 
 /** The broker refused a subscription with return code 0x80. */
 export class SubscribeRejected extends Data.TaggedError("SubscribeRejected")<{ readonly filter: string }> {}
 
+/**
+ * A backpressure subscription stayed full for longer than `maxPaused`, holding up every other subscription, so the
+ * client dropped it and resumed reading.
+ */
+export class SubscriptionStalled extends Data.TaggedError("SubscriptionStalled")<{ readonly filter: string; readonly message: string }> {}
+
 /** A topic or filter breaks the rules in section 4.7. */
 export class InvalidTopic extends Data.TaggedError("InvalidTopic")<{ readonly topic: string }> {}
 
@@ -30,6 +36,7 @@ export type MqttError =
   | ConnectionRefused
   | ProtocolError
   | SubscribeRejected
+  | SubscriptionStalled
   | InvalidTopic
   | InvalidOption
   | ClientClosed

@@ -67,6 +67,7 @@ PRINTER_HOST=192.0.2.10 PRINTER_SERIAL=... PRINTER_ACCESS_CODE=... bun examples/
 | `connectTimeout` | 10 seconds | Time allowed for the socket and CONNACK. |
 | `will` | none | `{ topic, payload, qos, retain }`, published by the broker if the client disappears without DISCONNECT. |
 | `reconnect` | exponential from 500 ms, capped at 30 s, forever | An Effect `Schedule` for reconnecting after an established connection drops. Its first delay comes before the first attempt. `false` closes the client on the first drop. |
+| `maxPaused` | off | How long one full subscription may keep the client paused before the client drops it. See [Slow consumers](#slow-consumers). |
 
 The first connection is not retried, so `connect` fails fast when the broker is unreachable or refuses the credentials. Reconnecting stops early on a refusal that retrying cannot fix, such as bad credentials.
 
@@ -87,6 +88,14 @@ const reports = yield* client.subscribe("device/+/report", { bufferSize: 64 })
 ```
 
 When a subscription is full, the client stops reading from the socket. TCP then pushes back on the broker, which queues or drops messages according to its own limits. Reading resumes once every full subscription has drained to half. The client keeps sending PINGREQ while paused, so a slow consumer does not cost the connection. It cannot read the PINGRESP until it resumes, though. A dead host or network still fails those PINGREQ writes at the TCP level, but a broker that stops answering while keeping its TCP connection open is detected only once the consumer catches up and reading resumes. Messages already read when a buffer fills are kept, so a buffer can exceed `bufferSize` by one socket read's worth.
+
+By default a consumer that never comes back keeps the client paused, and every other subscription waits with it. `maxPaused` puts a limit on that:
+
+```ts
+const client = yield* connect({ host, maxPaused: "30 seconds" })
+```
+
+A subscription that stays full for `maxPaused` is dropped. Its consumer gets the messages it already had, then its stream fails with `SubscriptionStalled`. The client unsubscribes if no other subscription uses the filter, and resumes reading for the rest. The limit counts how long the subscription has been full this time, so a consumer that stalls often but always catches up is never dropped. The check runs every quarter of `maxPaused`, so a drop can come up to a quarter late. Reading resumes after the drop, so this also limits how long a broker that stopped answering can go unnoticed: the PINGRESP deadline starts again then.
 
 When only the newest messages matter, such as a printer's status reports, set `overflow: "dropOldest"`:
 
@@ -115,8 +124,9 @@ Every error is a tagged error, so `Effect.catchTag` can handle each one.
 | `ConnectionError` | The socket failed, timed out, or closed, or keep-alive expired. |
 | `ConnectionRefused` | The broker refused CONNECT. `returnCode` holds its reason (section 3.2.2.3). |
 | `SubscribeRejected` | The broker answered SUBSCRIBE with 0x80 for the filter. |
+| `SubscriptionStalled` | A `"backpressure"` subscription stayed full past `maxPaused`, so the client dropped it. |
 | `InvalidTopic` | A topic has wildcards, or a filter misplaces `#` or `+`. |
-| `InvalidOption` | An option is out of range, such as a `bufferSize` below 1 or an unknown `overflow`. |
+| `InvalidOption` | An option is out of range, such as a `bufferSize` below 1, an unknown `overflow`, or a `maxPaused` that is not positive. |
 | `MalformedPacket` | The broker sent bytes that are not valid MQTT 3.1.1. |
 | `ProtocolError` | The broker sent a packet a client must not receive. |
 | `ClientClosed` | The client's scope closed, or reconnecting gave up. |

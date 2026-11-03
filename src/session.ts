@@ -99,8 +99,15 @@ export class Session {
     })
   }
 
-  unsubscribe(filters: ReadonlyArray<string>): Effect.Effect<void, MqttError> {
+  /**
+   * `stillWanted` is checked in the same synchronous step that writes UNSUBSCRIBE. When it returns false nothing is
+   * sent, so a filter subscribed again while this waited to run keeps its broker subscription.
+   */
+  unsubscribe(filters: ReadonlyArray<string>, stillWanted: () => boolean = () => true): Effect.Effect<void, MqttError> {
     return this.withPacketId((packetId) => {
+      // An identifier is taken only once a request holds it, so skipping here leaves nothing to release.
+      if (!stillWanted()) return Effect.void
+
       const done = Deferred.makeUnsafe<void, MqttError>()
       const packet = P.unsubscribe(packetId, filters)
 
