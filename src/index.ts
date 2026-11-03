@@ -4,7 +4,7 @@ export type { CloseOptions, ConnectOptions, Message, MqttClient, Overflow, Publi
 
 export { MalformedPacket } from "./codec.ts"
 
-export { ClientClosed, ConnectionError, ConnectionRefused, InvalidOption, InvalidTopic, ProtocolError, SubscribeRejected } from "./errors.ts"
+export { ClientClosed, ConnectionError, ConnectionRefused, InvalidOption, InvalidTopic, ProtocolError, SubscribeRejected, SubscriptionStalled } from "./errors.ts"
 
 export type { MqttError } from "./errors.ts"
 

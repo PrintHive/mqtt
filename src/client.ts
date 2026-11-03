@@ -19,7 +19,7 @@ import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
 import { Decoder, encode, MalformedPacket } from "./codec.ts"
-import { ClientClosed, ConnectionError, ConnectionRefused, InvalidOption, InvalidTopic, ProtocolError, refused, SubscribeRejected } from "./errors.ts"
+import { ClientClosed, ConnectionError, ConnectionRefused, InvalidOption, InvalidTopic, ProtocolError, refused, SubscribeRejected, SubscriptionStalled } from "./errors.ts"
 import type { MqttError } from "./errors.ts"
 import * as P from "./packet.ts"
 import type { Publish, QoS, Will } from "./packet.ts"
@@ -50,6 +50,16 @@ export interface ConnectOptions {
    * `connect` fails fast when the broker is unreachable.
    */
   readonly reconnect?: Schedule.Schedule<unknown, MqttError> | false | undefined
+  /**
+   * How long a full `"backpressure"` subscription may keep the client paused. Off by default, so a stuck consumer
+   * pauses the client until it comes back. Once a subscription has been full this long, it is dropped: its consumer
+   * gets the messages it already had, then fails with `SubscriptionStalled`, and the client resumes reading for the
+   * others. Checked every quarter of this, so the drop can come up to a quarter late.
+   *
+   * While paused the client cannot read PINGRESP, so a broker that stops answering is noticed only after reading
+   * resumes. This bounds how long that takes.
+   */
+  readonly maxPaused?: Duration.Input | undefined
 }
 
 export interface CloseOptions {
@@ -124,6 +134,8 @@ interface Subscriber {
   readonly queue: Queue.Queue<Message, MqttError | Cause.Done>
   /** Messages the consumer took in its last pull and may still be working through. They count against `capacity`. */
   held: number
+  /** When the subscriber last became full. Meaningful only while it is in the `full` set. */
+  fullSince: number
 }
 
 /** Messages a subscriber has in memory: queued, plus the chunk its consumer last took. */
@@ -139,6 +151,7 @@ interface Config {
   readonly keepAliveMs: number
   readonly connectTimeout: Duration.Input
   readonly reconnect: Schedule.Schedule<unknown, MqttError> | false
+  readonly maxPausedMs: number | undefined
 }
 
 const crashed = (cause: Cause.Cause<MqttError>) => new ClientClosed({ message: `the client crashed: ${Cause.pretty(cause)}` })
@@ -170,7 +183,8 @@ const configure = (options: ConnectOptions): Config => {
     }),
     keepAliveMs: keepAlive * 1000,
     connectTimeout: options.connectTimeout ?? "10 seconds",
-    reconnect: options.reconnect ?? DEFAULT_RECONNECT
+    reconnect: options.reconnect ?? DEFAULT_RECONNECT,
+    maxPausedMs: options.maxPaused === undefined ? undefined : Duration.toMillis(Duration.fromInputUnsafe(options.maxPaused))
   }
 }
 
@@ -392,6 +406,12 @@ const transient = (error: MqttError): boolean =>
 export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, MqttError, Scope.Scope> =>
   Effect.gen(function* () {
     const config = configure(options)
+
+    if (config.maxPausedMs !== undefined && !(config.maxPausedMs > 0 && Number.isFinite(config.maxPausedMs))) {
+      return yield* Effect.fail(new InvalidOption({ option: "maxPaused", message: `maxPaused must be a positive, finite duration, got ${config.maxPausedMs} ms` }))
+    }
+
+    const clock = yield* Clock.Clock
     const clientScope = yield* Effect.scope
     const subscribers = new TopicTree<Subscriber>()
     /** Live subscribers by filter. The broker holds one subscription per filter, at the highest QoS any of them asked for. */
@@ -414,6 +434,7 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
 
       if (s.overflow === "dropOldest" || full.has(s) || buffered(s) < s.capacity) return
 
+      s.fullSince = clock.currentTimeMillisUnsafe()
       full.add(s)
       current?.setReading(false)
     }
@@ -563,6 +584,25 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
         return Effect.forkIn(Effect.ignore(session.unsubscribe([subscriber.filter])), clientScope)
       })
 
+    /** Drops each subscription that has been full for `maxPaused`, which resumes reading once none are left. */
+    const dropStalled = (maxPausedMs: number) =>
+      Effect.suspend(() => {
+        const now = clock.currentTimeMillisUnsafe()
+        const stalled = [...full].filter((s) => now - s.fullSince >= maxPausedMs)
+
+        for (const s of stalled) {
+          const message = `the subscription to ${s.filter} stayed full for ${now - s.fullSince} ms, past maxPaused`
+
+          Queue.failCauseUnsafe(s.queue, Cause.fail(new SubscriptionStalled({ filter: s.filter, message })))
+        }
+
+        return Effect.forEach(stalled, release, { discard: true })
+      })
+
+    if (config.maxPausedMs !== undefined) {
+      yield* Effect.forkIn(Effect.repeat(dropStalled(config.maxPausedMs), Schedule.spaced(config.maxPausedMs / 4)), clientScope)
+    }
+
     const subscribe = (filter: string, subscribeOptions?: SubscribeOptions) =>
         Effect.gen(function* () {
           if (!isValidFilter(filter)) return yield* Effect.fail(new InvalidTopic({ topic: filter }))
@@ -587,7 +627,7 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
             ? Queue.sliding<Message, MqttError | Cause.Done>(capacity)
             : Queue.unbounded<Message, MqttError | Cause.Done>())
 
-          const subscriber: Subscriber = { filter, qos, capacity, overflow, queue, held: 0 }
+          const subscriber: Subscriber = { filter, qos, capacity, overflow, queue, held: 0, fullSince: 0 }
           const set = filters.get(filter) ?? new Set()
 
           // Register before SUBSCRIBE goes out, so retained messages that race the SUBACK are kept.
