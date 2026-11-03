@@ -600,7 +600,10 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
       })
 
     if (config.maxPausedMs !== undefined) {
-      yield* Effect.forkIn(Effect.repeat(dropStalled(config.maxPausedMs), Schedule.spaced(config.maxPausedMs / 4)), clientScope)
+      // Stops with the client, so a client closed early leaves no timer behind until its scope closes.
+      const checks = { schedule: Schedule.spaced(config.maxPausedMs / 4), while: () => closed === undefined }
+
+      yield* Effect.forkIn(Effect.repeat(dropStalled(config.maxPausedMs), checks), clientScope)
     }
 
     const subscribe = (filter: string, subscribeOptions?: SubscribeOptions) =>
