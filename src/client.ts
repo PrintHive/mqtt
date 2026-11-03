@@ -581,7 +581,10 @@ export const connect = (options: ConnectOptions): Effect.Effect<MqttClient, Mqtt
 
         filters.delete(subscriber.filter)
 
-        return Effect.forkIn(Effect.ignore(session.unsubscribe([subscriber.filter])), clientScope)
+        // Checked again when UNSUBSCRIBE is written: a subscriber that joins the filter before then keeps it.
+        const stillWanted = () => !filters.has(subscriber.filter)
+
+        return Effect.forkIn(Effect.ignore(session.unsubscribe([subscriber.filter], stillWanted)), clientScope)
       })
 
     /** Drops each subscription that has been full for `maxPaused`, which resumes reading once none are left. */

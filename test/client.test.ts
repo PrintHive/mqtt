@@ -295,6 +295,21 @@ describe("connect", () => {
       })
     ))
 
+  it("does not unsubscribe a filter that was subscribed again before the UNSUBSCRIBE went out", () =>
+    run(
+      Effect.gen(function* () {
+        const { port } = yield* aedes()
+        const client = yield* connect({ host, port })
+
+        yield* Effect.scoped(client.subscribe("x/y"))
+
+        const messages = yield* client.subscribe("x/y")
+
+        yield* client.publish("x/y", "still here", { qos: 1 })
+        expect((yield* messages.pipe(Stream.take(1), Stream.runCollect)).map(summary)).toEqual([["x/y", "still here", 0, false]])
+      })
+    ), 5000)
+
   it("keeps a confirmed subscription when a second one on the same filter is cancelled before its SUBACK", () =>
     run(
       Effect.gen(function* () {
@@ -591,6 +606,7 @@ describe("connect", () => {
           const got = yield* others.pipe(Stream.take(COUNT), Stream.runCollect)
           const error = yield* Effect.flip(Stream.runDrain(stuck))
 
+          expect(got.length).toBe(COUNT)
           expect(inOrder(got)).toBe(true)
           expect(error).toBeInstanceOf(SubscriptionStalled)
           expect(error).toMatchObject({ filter: "flood" })
@@ -613,6 +629,7 @@ describe("connect", () => {
             Stream.runCollect
           )
 
+          expect(got.length).toBe(COUNT)
           expect(inOrder(got)).toBe(true)
         })
       ), 15_000)
