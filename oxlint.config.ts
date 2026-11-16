@@ -37,7 +37,7 @@ export default defineConfig({
       // Every packet on the wire passes through these files. Effect tagged constructors plus Match dispatch
       // measured 4 to 6 times slower than plain objects with a switch (Bun 44M vs 7.7M ops/s, Node 16M vs
       // 4.3M, median of 5 runs), so the wire layer keeps plain tagged objects.
-      files: ["src/packet.ts", "src/codec.ts", "src/session.ts"],
+      files: ["src/packet.ts", "src/codec.ts", "src/session.ts", "src/server.ts"],
       rules: {
         "anti-slop-effect/no-manual-tag-comparison": "off",
         "anti-slop-effect/no-manual-tagged-construction": "off",
