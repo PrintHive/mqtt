@@ -131,6 +131,43 @@ Every error is a tagged error, so `Effect.catchTag` can handle each one.
 | `ProtocolError` | The broker sent a packet a client must not receive. |
 | `ClientClosed` | The client's scope closed, or reconnecting gave up. |
 
+## Run a server for tests and emulators
+
+`@printhive/mqtt/server` runs the broker side in-process, so a test or an emulator can talk to the real client over real sockets. It is not a general-purpose broker: it doesn't route between clients or keep retained messages.
+
+```ts
+import { Effect, Stream } from "effect"
+import { serve } from "@printhive/mqtt/server"
+
+const program = Effect.gen(function* () {
+  const server = yield* serve({
+    tls: { key, cert },
+    authenticate: (connect) => Effect.succeed(connect.username === "bblp" ? 0 : 5)
+  })
+
+  yield* Stream.runForEach(server.sessions, (session) =>
+    session.inbound.pipe(
+      Stream.runForEach((packet) =>
+        packet._tag === "Publish" ? Effect.asVoid(session.publish("device/X/report", '{"print":{}}')) : Effect.void
+      ),
+      Effect.forkScoped
+    )
+  )
+})
+```
+
+The server answers PINGREQ, UNSUBSCRIBE and the QoS 1 and 2 handshakes itself. SUBSCRIBE goes to `onSubscribe`, which chooses the SUBACK codes. The SUBACK waits for that Effect, so a test can stall it by sleeping, drop it with `Effect.never`, or refuse a filter with 0x80, while other packets keep flowing. Every packet also appears on the session's `inbound`, in order.
+
+Faults are Effects the test writes:
+- `write(packet)` sends any packet, for example a SUBACK with the wrong packet id.
+- `writeRaw(bytes)` sends malformed bytes.
+- `mute(true)` drops every write, PINGRESP included, like a printer that has gone silent.
+- `close("end" | "half-close" | "destroy")` ends the connection three ways.
+
+With `keepAlive: "ignore"`, the server never drops a silent client, which models a half-open socket.
+
+Sessions are buffered from the moment the server starts, and each session buffers up to `bufferSize` packets before the server stops reading its socket. As on the client, a paused session answers nothing, PINGREQ included, until its consumer catches up. The server closes with its scope, or earlier with `server.close({ force })`.
+
 ## Packets, the codec, and tests
 
 `@printhive/mqtt/packet` exports the MQTT 3.1.1 packet types and their constructors. `@printhive/mqtt/codec` exports `encode`, the incremental `Decoder`, and `MalformedPacket`. Tools that record or replay traffic can use them without opening a connection.
