@@ -233,12 +233,12 @@ describe("serve", () => {
     run(
       Effect.gen(function* () {
         const COUNT = 2000
-        const server = yield* serve({ authenticate: accept, bufferSize: 8 })
+        const server = yield* serve({ authenticate: accept, bufferSize: 16 })
         const client = yield* connect({ host, port: server.address.port })
         const session = yield* nextSession(server.sessions)
 
         const payload = (i: number) => {
-          const bytes = Buffer.alloc(4096)
+          const bytes = Buffer.alloc(16_384)
 
           bytes.writeUInt32BE(i)
 
@@ -251,7 +251,8 @@ describe("serve", () => {
           { startImmediately: true }
         )
 
-        // 8 MB on loopback would all be read within milliseconds; a paused server leaves the client still sending.
+        // 32 MB is more than the kernel buffers on both ends of a loopback socket, so a server that kept reading
+        // would let every publish finish at once; a paused one leaves the client still sending.
         yield* Effect.sleep("500 millis")
         expect(publishing.pollUnsafe()).toBeUndefined()
 
@@ -265,7 +266,7 @@ describe("serve", () => {
         expect(indexes).toEqual(Array.from({ length: COUNT }, (_, i) => i))
         yield* Fiber.join(publishing)
       })
-    ), 15_000)
+    ), 30_000)
 
   it("drops a client silent for one and a half keep-alive periods, unless told to ignore keep-alive", () =>
     run(
