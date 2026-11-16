@@ -354,6 +354,89 @@ describe("serve", () => {
       })
     ))
 
+  it("closes promptly while a TLS handshake is still pending", () =>
+    run(
+      Effect.gen(function* () {
+        // A raw TCP client on a TLS port never finishes the handshake, so it never becomes a session.
+        const forced = yield* serve({ authenticate: accept, tls: selfSigned() })
+
+        // The pause lets the server accept the connection, so the handshake is pending when close starts.
+        yield* rawClient(forced.address.port)
+        yield* Effect.sleep("100 millis")
+        yield* forced.close({ force: true }).pipe(Effect.timeout("2 seconds"))
+
+        const graceful = yield* serve({ authenticate: accept, tls: selfSigned(), connectTimeout: "300 millis" })
+
+        yield* rawClient(graceful.address.port)
+        yield* Effect.sleep("100 millis")
+        yield* graceful.close().pipe(Effect.timeout("2 seconds"))
+      })
+    ))
+
+  it("interrupts authenticate when its socket closes, and never emits that session", () =>
+    run(
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>()
+        const interrupted = yield* Deferred.make<void>()
+
+        const server = yield* serve({
+          authenticate: () =>
+            Effect.andThen(Deferred.succeed(started, undefined), Effect.never).pipe(
+              Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined))
+            )
+        })
+
+        const socket = yield* rawClient(server.address.port)
+
+        socket.write(connectPacket(0))
+        yield* Deferred.await(started)
+        socket.destroy()
+        yield* Deferred.await(interrupted)
+
+        const session = yield* Stream.runHead(server.sessions).pipe(Effect.timeout("300 millis"), Effect.option)
+
+        expect(Option.isNone(session)).toBe(true)
+      })
+    ))
+
+  it("does not let a late SUBSCRIBE decision undo a later UNSUBSCRIBE", () =>
+    run(
+      Effect.gen(function* () {
+        const gate = yield* Deferred.make<void>()
+        const asked = yield* Deferred.make<void>()
+
+        const server = yield* serve({
+          authenticate: accept,
+          onSubscribe: (_session, request) =>
+            Effect.andThen(Deferred.succeed(asked, undefined), Effect.as(Deferred.await(gate), request.subscriptions.map((s) => s.qos)))
+        })
+
+        const socket = yield* rawClient(server.address.port)
+        const subacks = yield* Deferred.make<void>()
+
+        socket.on("data", (chunk: Buffer) => {
+          // SUBACK is packet type 9 (0x90); it may share a chunk with CONNACK or UNSUBACK.
+          if (chunk.includes(0x90)) Deferred.doneUnsafe(subacks, Effect.void)
+        })
+        socket.write(connectPacket(0))
+
+        const session = yield* nextSession(server.sessions)
+
+        socket.write(encode(P.subscribe(1, [{ filter: "device/X/report", qos: 0 }])))
+        yield* Deferred.await(asked)
+        socket.write(encode(P.unsubscribe(2, ["device/X/report"])))
+        yield* session.inbound.pipe(
+          Stream.filter((packet) => Predicate.isTagged(packet, "Unsubscribe")),
+          Stream.take(1),
+          Stream.runDrain
+        )
+        yield* Deferred.succeed(gate, undefined)
+        yield* Deferred.await(subacks)
+
+        expect(yield* session.subscriptions).toEqual([])
+      })
+    ))
+
   it("rejects a bufferSize below 1 and a port already in use", () =>
     run(
       Effect.gen(function* () {

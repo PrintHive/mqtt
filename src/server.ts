@@ -9,6 +9,7 @@ import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import * as Option from "effect/Option"
 import * as Predicate from "effect/Predicate"
 import * as Queue from "effect/Queue"
 import * as Schedule from "effect/Schedule"
@@ -226,6 +227,8 @@ export const serve = <R>(options: ServeOptions<R>): Effect.Effect<Server, ServeE
     const accepted = yield* Queue.unbounded<net.Socket>()
     const sessions = yield* Queue.unbounded<ServerSession, Cause.Done>()
     const wires = new Set<Wire>()
+    /** Every TCP socket from accept to close, a TLS handshake still in progress included. */
+    const sockets = new Set<net.Socket>()
     let nextSession = 0
     let closing: Effect.Effect<void> | undefined = undefined
 
@@ -240,6 +243,10 @@ export const serve = <R>(options: ServeOptions<R>): Effect.Effect<Server, ServeE
 
     // A TLS handshake failure surfaces here, not on any socket we hold.
     listener.on("tlsClientError", (_error, socket) => socket.destroy())
+    listener.on("connection", (socket: net.Socket) => {
+      sockets.add(socket)
+      socket.once("close", () => sockets.delete(socket))
+    })
 
     yield* bindListener(listener, host, options.port ?? 0)
 
@@ -264,11 +271,23 @@ export const serve = <R>(options: ServeOptions<R>): Effect.Effect<Server, ServeE
 
         const connect = first.value
         const peer = peerOf(socket)
-        const code = yield* Effect.exit(options.authenticate(connect, peer))
+
+        // A socket that closes while authenticate runs interrupts it, so a hook that never completes cannot leak.
+        const decided = yield* Effect.raceFirst(
+          Effect.map(Effect.exit(options.authenticate(connect, peer)), Option.some),
+          Effect.as(Deferred.await(wire.gone), Option.none())
+        )
+
+        if (Option.isNone(decided)) return
+
+        const code = decided.value
 
         if (!Exit.isSuccess(code)) return wire.fail(new ConnectionError({ message: "authenticate failed" }))
 
-        yield* Effect.ignore(wire.send(encode(P.connack(false, code.value))))
+        // A session exists only once its CONNACK is on the wire.
+        const acknowledged = yield* Effect.exit(wire.send(encode(P.connack(false, code.value))))
+
+        if (!Exit.isSuccess(acknowledged)) return wire.fail(new ConnectionError({ message: "the connection closed before CONNACK" }))
 
         if (code.value !== 0) return wire.close("end")
 
@@ -287,6 +306,9 @@ export const serve = <R>(options: ServeOptions<R>): Effect.Effect<Server, ServeE
         let reading = true
         let lastReceived = clock.currentTimeMillisUnsafe()
         let packetId = 0
+        /** Each filter's latest SUBSCRIBE or UNSUBSCRIBE, so a decision that arrives late cannot undo a newer one. */
+        const latest = new Map<string, number>()
+        let request = 0
 
         const buffered = () => Queue.sizeUnsafe(inbound) + held
 
@@ -309,12 +331,12 @@ export const serve = <R>(options: ServeOptions<R>): Effect.Effect<Server, ServeE
 
         const subscriptions = Effect.sync(() => [...filters.values()])
 
-        const grant = (request: Subscribe, codes: ReadonlyArray<SubackCode>) =>
+        const grant = (subscribe: Subscribe, order: number, codes: ReadonlyArray<SubackCode>) =>
           Effect.suspend(() => {
-            request.subscriptions.forEach((subscription, i) => {
+            subscribe.subscriptions.forEach((subscription, i) => {
               const code = codes[i]
 
-              if (code === undefined || code === 0x80) return
+              if (code === undefined || code === 0x80 || latest.get(subscription.filter) !== order) return
 
               const previous = filters.get(subscription.filter)
 
@@ -326,7 +348,8 @@ export const serve = <R>(options: ServeOptions<R>): Effect.Effect<Server, ServeE
               granted.add(next.filter, next)
             })
 
-            return send(P.suback(request.packetId, codes))
+            // The SUBACK still answers its own request, even when a newer one has since decided the filter.
+            return send(P.suback(subscribe.packetId, codes))
           })
 
         const self: ServerSession = {
@@ -386,8 +409,12 @@ export const serve = <R>(options: ServeOptions<R>): Effect.Effect<Server, ServeE
           switch (packet._tag) {
             case "Pingreq":
               return send(P.pingresp)
-            case "Unsubscribe":
+            case "Unsubscribe": {
+              const order = ++request
+
               for (const filter of packet.filters) {
+                latest.set(filter, order)
+
                 const previous = filters.get(filter)
 
                 if (previous === undefined) continue
@@ -397,6 +424,8 @@ export const serve = <R>(options: ServeOptions<R>): Effect.Effect<Server, ServeE
               }
 
               return send(P.unsuback(packet.packetId))
+            }
+
             case "Publish":
               if (packet.qos === 1) return send(P.puback(packet.packetId))
 
@@ -408,6 +437,10 @@ export const serve = <R>(options: ServeOptions<R>): Effect.Effect<Server, ServeE
             case "Pubrec":
               return send(P.pubrel(packet.packetId))
             case "Subscribe": {
+              const order = ++request
+
+              for (const subscription of packet.subscriptions) latest.set(subscription.filter, order)
+
               const decide =
                 options.onSubscribe === undefined
                   ? Effect.succeed(packet.subscriptions.map((subscription): SubackCode => subscription.qos))
@@ -418,7 +451,7 @@ export const serve = <R>(options: ServeOptions<R>): Effect.Effect<Server, ServeE
                 Effect.forkIn(
                   Effect.matchCauseEffect(decide, {
                     onFailure: () => Effect.sync(() => wire.fail(new ConnectionError({ message: "onSubscribe failed" }))),
-                    onSuccess: (codes) => Effect.ignore(grant(packet, codes))
+                    onSuccess: (codes) => Effect.ignore(grant(packet, order, codes))
                   }),
                   connectionScope
                 )
@@ -488,25 +521,26 @@ export const serve = <R>(options: ServeOptions<R>): Effect.Effect<Server, ServeE
 
         const live = [...wires]
 
-        for (const wire of live) wire.close(force ? "destroy" : "end")
+        // A socket still in its TLS handshake has no session to end gracefully, and holds listener.close open.
+        const destroyAll = () => {
+          for (const wire of wires) wire.close("destroy")
+
+          for (const socket of sockets) socket.destroy()
+        }
+
+        if (force) destroyAll()
+        else for (const wire of live) wire.close("end")
 
         const gone = Effect.forEach(live, (wire) => Deferred.await(wire.gone), { discard: true })
+        const finished = Effect.all([stopped, gone], { discard: true, concurrency: "unbounded" })
 
-        closing = Effect.andThen(
-          Effect.all(
-            [
-              stopped,
-              gone.pipe(
-                Effect.timeoutOrElse({
-                  duration: connectTimeout,
-                  orElse: () => Effect.andThen(Effect.sync(() => live.forEach((wire) => wire.close("destroy"))), gone)
-                })
-              )
-            ],
-            { discard: true, concurrency: "unbounded" }
-          ),
-          Queue.end(sessions)
-        ).pipe(Effect.asVoid, Effect.cached, Effect.runSync)
+        closing = finished.pipe(
+          Effect.timeoutOrElse({ duration: connectTimeout, orElse: () => Effect.andThen(Effect.sync(destroyAll), finished) }),
+          Effect.andThen(Queue.end(sessions)),
+          Effect.asVoid,
+          Effect.cached,
+          Effect.runSync
+        )
 
         return closing
       })
