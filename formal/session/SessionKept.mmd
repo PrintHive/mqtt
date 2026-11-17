@@ -1,0 +1,50 @@
+---
+title: "Your QoS 2 publish across dropped connections"
+---
+stateDiagram-v2
+  direction LR
+  state "Legend" as legend {
+    lg0: good
+    lg1: working
+  }
+  class lg0 teal
+  class lg1 blue
+  state "At the same time" as all {
+    state "Your publish" as r0 {
+      s0: Not published
+      s1: Sent, waiting for PUBREC
+      s2: Waiting for a connection
+      s3: Given up before sending
+      s4: PUBREL sent, waiting for PUBCOMP
+      s5: Publish succeeded
+      [*] --> s0
+      s0 --> s1: you publish at QoS 2 [when Connection is Connected]
+      s0 --> s2: you publish at QoS 2 [when Connection is Dropped]
+      s2 --> s3: you interrupt the publish
+      s2 --> s1: the client reconnects
+      s1 --> s4: PUBREC arrives [when Connection is Connected and Broker is Delivered once]
+      s4 --> s5: PUBCOMP arrives [when Connection is Connected]
+    }
+    --
+    state "Connection" as r1 {
+      s6: Connected
+      s7: Dropped
+      [*] --> s6
+      s6 --> s7: the connection drops
+      s7 --> s6: the client reconnects
+    }
+    --
+    state "Broker" as r2 {
+      s8: Not delivered
+      s9: Delivered once
+      [*] --> s8
+      s8 --> s9: the broker gets PUBLISH [when Your publish is Sent, waiting for PUBREC and Connection is Connected]
+    }
+  }
+  class s0 blue
+  class s1 blue
+  class s2 blue
+  class s3 blue
+  class s4 blue
+  class s5 teal
+  class s8 blue

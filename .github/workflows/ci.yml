@@ -71,3 +71,25 @@ jobs:
       - run: bunx lsc check --backend=dafny
       - name: Check the committed generated Dafny is current
         run: git diff --exit-code -- '*.dfy.gen'
+
+  # TLA+ model of QoS 2 across dropped connections. See .agents/skills/verify-session-qos2/SKILL.md.
+  models:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    env:
+      TLA2TOOLS_SHA256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+      - name: Install TLC
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/tla2tools.jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "${TLA2TOOLS_SHA256}  $RUNNER_TEMP/tla2tools.jar" | sha256sum -c -
+          echo "TLA2TOOLS=$RUNNER_TEMP/tla2tools.jar" >> "$GITHUB_ENV"
+      - run: bun .agents/skills/verify-session-qos2/scripts/check.ts check
+      - run: bun .agents/skills/verify-session-qos2/scripts/check.ts mutants
