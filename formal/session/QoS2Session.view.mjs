@@ -12,6 +12,8 @@ const publish = (v) => {
       return "Publish succeeded";
     case "dropped":
       return "Given up before sending";
+    case "unknown":
+      return "Failed: delivery unknown";
   }
 };
 
@@ -42,7 +44,9 @@ export const step = (action, from, to) => {
     case "ConnectionDrops":
       return "the connection drops";
     case "Reconnects":
-      return from.held && !to.held ? "the client reconnects [the broker forgot the session]" : "the client reconnects";
+      return from.out !== to.out && to.out === "unknown"
+        ? "the client reconnects [the broker forgot the session]"
+        : "the client reconnects";
     // The broker's own message to you. These steps stay inside one chart state, so the chart draws none of them.
     case "ClientGetsPublish":
       return "the broker's message arrives";

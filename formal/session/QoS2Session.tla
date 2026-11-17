@@ -22,7 +22,8 @@ CONSTANTS
 VARIABLES
     \* Client: src/session.ts
     out,        \* your message's InFlight entry: "none" (not yet published), "Unacked", "Released",
-                \* "done" (PUBCOMP resolved the caller) or "dropped" (interrupted before written)
+                \* "done" (PUBCOMP resolved the caller), "dropped" (interrupted before written) or
+                \* "unknown" (failed with DeliveryUnknown: written, then the broker lost the session)
     written,    \* InFlight.written
     received,   \* Session.received holds the broker's message id
     delivered,  \* times the deliver callback got the broker's message
@@ -66,7 +67,7 @@ YouGiveUp ==
     /\ out' = "dropped"
     /\ UNCHANGED <<written, received, delivered, held, onward, sending, up, drops, toBroker, toClient>>
 
-\* receive, Pubrec, session.ts 176-185: mark Released if waiting, and answer PUBREL in any case.
+\* receive, Pubrec, session.ts 190-199: mark Released if waiting, and answer PUBREL in any case.
 ClientGetsPubrec ==
     /\ toClient /= << >> /\ Head(toClient) = "PUBREC"
     /\ toClient' = Tail(toClient)
@@ -74,14 +75,14 @@ ClientGetsPubrec ==
     /\ Send("PUBREL")
     /\ UNCHANGED <<written, received, delivered, held, onward, sending, up, drops>>
 
-\* receive, Pubcomp -> finish, session.ts 187-188 and 241-248: finish does not check the stage.
+\* receive, Pubcomp -> finish, session.ts 201-202 and 255-262: finish does not check the stage.
 ClientGetsPubcomp ==
     /\ toClient /= << >> /\ Head(toClient) = "PUBCOMP"
     /\ toClient' = Tail(toClient)
     /\ out' = IF out \in {"Unacked", "Released"} THEN "done" ELSE out
     /\ UNCHANGED <<written, received, delivered, held, onward, sending, up, drops, toBroker>>
 
-\* incoming, session.ts 233-238: deliver unless the id is held, then PUBREC.
+\* incoming, session.ts 247-252: deliver unless the id is held, then PUBREC.
 ClientGetsPublish ==
     /\ toClient /= << >> /\ Head(toClient) = "PUBLISH"
     /\ toClient' = Tail(toClient)
@@ -92,7 +93,7 @@ ClientGetsPublish ==
     /\ Send("PUBREC")
     /\ UNCHANGED <<out, written, held, onward, sending, up, drops>>
 
-\* receive, Pubrel, session.ts 169-173.
+\* receive, Pubrel, session.ts 183-187.
 ClientGetsPubrel ==
     /\ toClient /= << >> /\ Head(toClient) = "PUBREL"
     /\ toClient' = Tail(toClient)
@@ -147,31 +148,35 @@ ConnectionDrops ==
     /\ toBroker' = << >> /\ toClient' = << >>
     /\ UNCHANGED <<out, written, received, delivered, held, onward, sending>>
 
-\* client.ts 468-472, then attach, session.ts 125-139, which resends every unfinished exchange
-\* even when sessionPresent is 0. The broker resends its own per section 4.4. A broker that
-\* forgets the session forgets both directions.
+\* client.ts 468-472, then attach, session.ts 129-153. With sessionPresent 0 a written entry
+\* fails with DeliveryUnknown and is not resent; an unwritten one goes out for the first time.
+\* Otherwise every unfinished exchange is resent. The broker resends its own per section 4.4.
+\* A broker that forgets the session forgets both directions.
 Reconnects ==
     /\ ~up
     /\ \E present \in IF BrokerMayForget THEN BOOLEAN ELSE {TRUE}:
         LET brokerSending == IF present \/ sending \notin {"Unacked", "Released"} THEN sending ELSE "lost"
-            clientResend == CASE out = "Released" -> << "PUBREL" >>
+            lostOut == ~present /\ written /\ out \in {"Unacked", "Released"}
+            clientResend == CASE lostOut          -> << >>
+                              [] out = "Released" -> << "PUBREL" >>
                               [] out = "Unacked"  -> << "PUBLISH" >>
                               [] OTHER            -> << >>
             brokerResend == CASE brokerSending = "Released" -> << "PUBREL" >>
                               [] brokerSending = "Unacked"  -> << "PUBLISH" >>
                               [] OTHER                      -> << >>
         IN /\ up' = TRUE
+           /\ out' = IF lostOut THEN "unknown" ELSE out
            /\ received' = (received /\ present)
            /\ held' = (held /\ present)
            /\ sending' = brokerSending
-           /\ written' = (written \/ out \in {"Unacked", "Released"})
+           /\ written' = IF lostOut THEN written ELSE (written \/ out \in {"Unacked", "Released"})
            /\ toBroker' = clientResend
            /\ toClient' = brokerResend
-    /\ UNCHANGED <<out, delivered, onward, drops>>
+    /\ UNCHANGED <<delivered, onward, drops>>
 
 \* Nothing left to happen: both exchanges ended and nothing is in flight.
 Done ==
-    /\ out \in {"done", "dropped"} /\ sending \in {"done", "lost"}
+    /\ out \in {"done", "dropped", "unknown"} /\ sending \in {"done", "lost"}
     /\ toBroker = << >> /\ toClient = << >>
     /\ UNCHANGED vars
 
@@ -195,6 +200,9 @@ DoneMeansDelivered == out = "done" => onward >= 1
 \* A publish interrupted before it was written is never delivered and never sent.
 GivenUpMeansNeverSent == out = "dropped" => onward = 0 /\ \A i \in 1..Len(toBroker): toBroker[i] /= "PUBLISH"
 
+\* DeliveryUnknown only for a message that may have reached the broker.
+UnknownOnlyWhenWritten == out = "unknown" => written
+
 \* The broker's QoS 2 message reaches your subscription at most once.
 BrokersMessageAtMostOnce == delivered <= 1
 
@@ -202,7 +210,7 @@ BrokersMessageAtMostOnce == delivered <= 1
 BrokerDoneMeansReceived == sending = "done" => delivered >= 1
 
 TypeOK ==
-    /\ out \in {"none", "Unacked", "Released", "done", "dropped"}
+    /\ out \in {"none", "Unacked", "Released", "done", "dropped", "unknown"}
     /\ sending \in {"none", "Unacked", "Released", "done", "lost"}
     /\ drops \in 0..MaxDrops
 =============================================================================

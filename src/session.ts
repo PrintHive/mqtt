@@ -2,7 +2,7 @@ import type { Buffer } from "node:buffer"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import { encode } from "./codec.ts"
-import { ClientClosed, ProtocolError } from "./errors.ts"
+import { ClientClosed, DeliveryUnknown, ProtocolError } from "./errors.ts"
 import type { MqttError } from "./errors.ts"
 import * as P from "./packet.ts"
 import type { Packet, Publish, PublishAcknowledged, QoS, SubackCode, Subscription } from "./packet.ts"
@@ -119,13 +119,27 @@ export class Session {
   }
 
   /**
-   * Attaches a new connection. With `sessionPresent` false the broker forgot the session, so incoming QoS 2 state is
-   * dropped; outgoing handshakes are still resent, since the caller is still waiting on them (section 4.4).
+   * Attaches a new connection and resends every unfinished exchange (section 4.4).
+   *
+   * With `sessionPresent` false the broker has no record of the old session, so the client discards its share too
+   * (section 3.1.2.4): incoming QoS 2 state is dropped, and each publish already written fails with `DeliveryUnknown`
+   * instead of going out again, since the broker may already have delivered it. A publish never written is sent now
+   * for the first time. SUBSCRIBE and UNSUBSCRIBE are resent either way: repeating one changes nothing.
    */
   attach(link: Link, sessionPresent: boolean): void {
     this.link = link
 
-    if (!sessionPresent) this.received.clear()
+    if (!sessionPresent) {
+      this.received.clear()
+
+      for (const [id, f] of this.inFlight) {
+        if (!f.written) continue
+
+        this.inFlight.delete(id)
+        const message = `the connection dropped during the QoS ${f.packet.qos} handshake and the broker did not keep the session, so the message may or may not have been delivered`
+        Deferred.doneUnsafe(f.done, Effect.fail(new DeliveryUnknown({ topic: f.packet.topic, message })))
+      }
+    }
 
     // A link that failed between CONNACK and attach takes nothing, and nothing it was handed counts as written.
     if (!link.accepting) return

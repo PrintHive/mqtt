@@ -1,13 +1,13 @@
 ---
 name: verify-session-qos2
-description: Model-check QoS 2 delivery across dropped connections with TLA+ (formal/session): at most once each way, publish success means delivered, an interrupted unsent publish is never sent, nothing waits forever. Use when a change touches Session in src/session.ts (attach, detach, receive, incoming, finish, publishAcknowledged, close) or the reconnect loop in src/client.ts that attaches and detaches it.
+description: Model-check QoS 2 delivery across dropped connections with TLA+ (formal/session): at most once each way, publish success means delivered, an interrupted unsent publish is never sent, DeliveryUnknown only for a written publish, nothing waits forever. Use when a change touches Session in src/session.ts (attach, detach, receive, incoming, finish, publishAcknowledged, close) or the reconnect loop in src/client.ts that attaches and detaches it.
 ---
 
 # Verify session QoS 2
 
 `formal/session/QoS2Session.tla` models the QoS 2 handshakes of `src/session.ts` while the connection drops and the
 broker may or may not keep the session. Read [formal/session/README.md](../../../formal/session/README.md) for the
-six rules, their harm, the bounds, and the known finding. Read every TLC result with the `/statechart` skill: it
+seven rules, their harm, the bounds, and the fixed finding. Read every TLC result with the `/statechart` skill: it
 gives each broken rule as its shortest path in plain words and draws the chart.
 
 ## Coverage
@@ -19,10 +19,10 @@ Sync commit: `65aca313e38cb15aef7603e5b8952613117895cb`
 | File | Functions and lines at the sync commit | Model action |
 | --- | --- | --- |
 | `src/session.ts` | `publishAcknowledged` 70-88 | `YouPublish`, `YouGiveUp` |
-| `src/session.ts` | `attach` 125-139 | `Reconnects` (client side) |
-| `src/session.ts` | `receive` Pubrel 169-173, Pubrec 176-185, Pubcomp 187-188 | `ClientGetsPubrel`, `ClientGetsPubrec`, `ClientGetsPubcomp` |
-| `src/session.ts` | `incoming` 223-239 | `ClientGetsPublish` |
-| `src/session.ts` | `finish` 241-248 | `ClientGetsPubcomp` |
+| `src/session.ts` | `attach` 129-153 | `Reconnects` (client side) |
+| `src/session.ts` | `receive` Pubrel 183-187, Pubrec 190-199, Pubcomp 201-202 | `ClientGetsPubrel`, `ClientGetsPubrec`, `ClientGetsPubcomp` |
+| `src/session.ts` | `incoming` 237-253 | `ClientGetsPublish` |
+| `src/session.ts` | `finish` 255-262 | `ClientGetsPubcomp` |
 | `src/client.ts` | `run` 486-490 (detach on `connection.lost`), 468-472 (attach after CONNACK) | `ConnectionDrops`, `Reconnects` |
 
 The broker actions follow MQTT 3.1.1 section 4.3.3, not code in this repo.
@@ -52,10 +52,10 @@ The broker actions follow MQTT 3.1.1 section 4.3.3, not code in this repo.
    bun .agents/skills/verify-session-qos2/scripts/check.ts mutants   # about 6 s
    ```
 
-   `check` passes when `SessionKept.cfg` holds every rule and `SessionForgotten.cfg` breaks only
-   `YourMessageAtMostOnce`, the known finding. `mutants` first refuses (`REFUSED`) if the model is already broken,
-   then applies seven code changes to the model, each written as the matching change to `src/session.ts`, and
-   requires TLC to name the rule each one breaks. Every rule, `NoDeadlock` included, has a mutant.
+   `check` passes when both `SessionKept.cfg` and `SessionForgotten.cfg` hold every rule. `mutants` first refuses
+   (`REFUSED`) if the model is already broken, then applies nine code changes to the model, each written as the
+   matching change to `src/session.ts`, and requires TLC to name the rule each one breaks. Every rule, `NoDeadlock`
+   included, has a mutant; one puts back the resend that caused the fixed finding.
 
 4. For a picture or a new break, run `/statechart` on `formal/session/QoS2Session.tla` with the config, the view
    `formal/session/QoS2Session.view.mjs`, and a fresh output folder. When it changes the chart, copy `chart.mmd` over
@@ -66,15 +66,15 @@ The broker actions follow MQTT 3.1.1 section 4.3.3, not code in this repo.
 ## Tell a bug from a modeling error
 
 A new broken rule is a bug in the code until shown otherwise. Replay its path against the real client, one step per
-action, as `scripts/replay-duplicate.ts` does for the known finding with `serve()` as the broker
-(`bun .agents/skills/verify-session-qos2/scripts/replay-duplicate.ts` exits 1 while the duplicate happens). If the
+action, as `scripts/replay-duplicate.ts` does for the fixed finding with `serve()` as the broker
+(`bun .agents/skills/verify-session-qos2/scripts/replay-duplicate.ts` exits 1 if the duplicate comes back). If the
 path cannot happen in the real code, the model is wrong: fix the model, never the rule.
 
-## Known finding
+## Fixed finding
 
-With `sessionPresent = 0`, which is every reconnect under the default `cleanSession: true`, `attach` resends an
-unfinished QoS 2 PUBLISH, and the broker delivers it a second time. See the README. If the code changes to discard
-or fail unfinished exchanges on a fresh session, update `Reconnects` and expect `SessionForgotten.cfg` to pass.
+Before 0.6.0, with `sessionPresent = 0`, `attach` resent an unfinished QoS 2 PUBLISH, and the broker delivered it a
+second time. Now a written publish fails with `DeliveryUnknown` instead. See the README. The tests that pin it are
+"fails a written QoS %i publish with DeliveryUnknown" in `test/session.test.ts` and `test/client.test.ts`.
 
 ## Not covered
 

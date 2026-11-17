@@ -22,6 +22,14 @@ export class SubscribeRejected extends Data.TaggedError("SubscribeRejected")<{ r
  */
 export class SubscriptionStalled extends Data.TaggedError("SubscriptionStalled")<{ readonly filter: string; readonly message: string }> {}
 
+/**
+ * A QoS 1 or 2 publish was written to a connection that dropped before its handshake finished, and the broker came
+ * back without the session (`sessionPresent` 0, as on every reconnect with `cleanSession: true`). The broker may or
+ * may not have delivered the message. It is not sent again: a resend to a fresh session can deliver it twice
+ * (section 3.1.2.4). Retry only if a second delivery is safe.
+ */
+export class DeliveryUnknown extends Data.TaggedError("DeliveryUnknown")<{ readonly topic: string; readonly message: string }> {}
+
 /** A topic or filter breaks the rules in section 4.7. */
 export class InvalidTopic extends Data.TaggedError("InvalidTopic")<{ readonly topic: string }> {}
 
@@ -37,6 +45,7 @@ export type MqttError =
   | ProtocolError
   | SubscribeRejected
   | SubscriptionStalled
+  | DeliveryUnknown
   | InvalidTopic
   | InvalidOption
   | ClientClosed
