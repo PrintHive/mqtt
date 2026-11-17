@@ -39,28 +39,29 @@ const tlc = (text: string, config: string): string | undefined => {
   }
 }
 
-// Each mutant is a change to src/session.ts written as the same change to the model, and the rule it must break.
-const mutants: ReadonlyArray<readonly [string, string, string, string]> = [
+// Each mutant is a change to src/session.ts written as the same change to the model, the rule it must break, and the
+// config that shows it (SessionKept unless named).
+const mutants: ReadonlyArray<readonly [string, string, string, string, string?]> = [
   [
-    "incoming delivers a resent PUBLISH again (session.ts 233: no received check)",
+    "incoming delivers a resent PUBLISH again (session.ts 247: no received check)",
     "    /\\ IF received\n          THEN UNCHANGED <<received, delivered>>",
     "    /\\ IF FALSE\n          THEN UNCHANGED <<received, delivered>>",
     "BrokersMessageAtMostOnce"
   ],
   [
-    "attach clears received even with sessionPresent (session.ts 128)",
+    "attach clears received even with sessionPresent (session.ts 133)",
     "           /\\ received' = (received /\\ present)",
     "           /\\ received' = FALSE",
     "BrokersMessageAtMostOnce"
   ],
   [
-    "attach resends PUBLISH for a Released entry instead of PUBREL (session.ts 134)",
-    "            clientResend == CASE out = \"Released\" -> << \"PUBREL\" >>",
-    "            clientResend == CASE out = \"Released\" -> << \"PUBLISH\" >>",
+    "attach resends PUBLISH for a Released entry instead of PUBREL (session.ts 148)",
+    "                              [] out = \"Released\" -> << \"PUBREL\" >>",
+    "                              [] out = \"Released\" -> << \"PUBLISH\" >>",
     "YourMessageAtMostOnce"
   ],
   [
-    "attach does not resend unfinished exchanges (session.ts 133-136)",
+    "attach does not resend unfinished exchanges (session.ts 147-150)",
     "           /\\ toBroker' = clientResend",
     "           /\\ toBroker' = << >>",
     "deadlock"
@@ -78,10 +79,24 @@ const mutants: ReadonlyArray<readonly [string, string, string, string]> = [
     "DoneMeansDelivered"
   ],
   [
-    "incoming answers PUBREC without delivering (session.ts 235 removed)",
+    "incoming answers PUBREC without delivering (session.ts deliver call removed)",
     "               /\\ delivered' = delivered + 1",
     "               /\\ delivered' = delivered",
     "BrokerDoneMeansReceived"
+  ],
+  [
+    "attach resends a written publish to a broker that lost the session (session.ts 135-142 removed, the behaviour before 0.6.0)",
+    "            lostOut == ~present /\\ written /\\ out \\in {\"Unacked\", \"Released\"}",
+    "            lostOut == FALSE",
+    "YourMessageAtMostOnce",
+    "SessionForgotten.cfg"
+  ],
+  [
+    "attach fails an unwritten publish too on a fresh session (session.ts 136)",
+    "            lostOut == ~present /\\ written /\\ out \\in {\"Unacked\", \"Released\"}",
+    "            lostOut == ~present /\\ out \\in {\"Unacked\", \"Released\"}",
+    "UnknownOnlyWhenWritten",
+    "SessionForgotten.cfg"
   ]
 ]
 
@@ -92,12 +107,12 @@ if (mode === "check") {
   const forgotten = tlc(model, "SessionForgotten.cfg")
 
   console.log(`SessionKept: ${kept ?? "every rule holds"}`)
-  console.log(`SessionForgotten: ${forgotten ?? "every rule holds"} (expected: YourMessageAtMostOnce, the known finding)`)
-  process.exit(kept === undefined && forgotten === "YourMessageAtMostOnce" ? 0 : 1)
+  console.log(`SessionForgotten: ${forgotten ?? "every rule holds"}`)
+  process.exit(kept === undefined && forgotten === undefined ? 0 : 1)
 }
 
 if (mode === "mutants") {
-  const baseline = tlc(model, "SessionKept.cfg")
+  const baseline = tlc(model, "SessionKept.cfg") ?? tlc(model, "SessionForgotten.cfg")
 
   if (baseline !== undefined) {
     console.log(`REFUSED: the model breaks ${baseline} before any mutant`)
@@ -106,7 +121,7 @@ if (mode === "mutants") {
 
   let missed = 0
 
-  for (const [name, from, to, rule] of mutants) {
+  for (const [name, from, to, rule, config = "SessionKept.cfg"] of mutants) {
     const at = model.indexOf(from)
 
     if (at === -1 || model.indexOf(from, at + 1) !== -1) {
@@ -115,7 +130,7 @@ if (mode === "mutants") {
       continue
     }
 
-    const broken = tlc(model.replace(from, to), "SessionKept.cfg")
+    const broken = tlc(model.replace(from, to), config)
     const caught = broken === rule
 
     if (!caught) missed++

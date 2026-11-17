@@ -3,7 +3,7 @@
 A fast MQTT 3.1.1 client for [Effect](https://effect.website), on Bun and Node.js.
 
 - QoS 0, 1, and 2 in both directions, retained messages, wills, and TLS.
-- Reconnects with an Effect `Schedule`, resends unfinished QoS 1 and 2 messages, and resubscribes when the broker lost the session.
+- Reconnects with an Effect `Schedule`, resends unfinished QoS 1 and 2 messages when the broker kept the session, and resubscribes when it did not.
 - Subscriptions are scoped streams with bounded buffers. A slow consumer makes the client stop reading, so TCP pushes back on the broker instead of memory growing.
 - No runtime dependencies besides the `effect` peer dependency. It runs on `node:net` and `node:tls`, which Bun also implements.
 - About 4 times faster than mqtt.js at decoding packets, and 1.2 to 1.7 times its end-to-end QoS 0 throughput. See [Performance](#performance).
@@ -62,7 +62,7 @@ PRINTER_HOST=192.0.2.10 PRINTER_SERIAL=... PRINTER_ACCESS_CODE=... bun examples/
 | `tls` | off | `true` uses TLS with the runtime's CA store. An object passes through to `tls.connect`, for example `{ ca }` or `{ rejectUnauthorized: false }`. |
 | `clientId` | `printhive-` and 12 random hex digits | MQTT client identifier. |
 | `username`, `password` | none | Credentials. The password can be a string or bytes. |
-| `cleanSession` | `true` | With `false`, the broker keeps subscriptions and queued QoS 1 and 2 messages across reconnects. |
+| `cleanSession` | `true` | With `false`, the broker keeps subscriptions and queued QoS 1 and 2 messages across reconnects, so an unfinished QoS 1 or 2 publish can finish after one. See [Publish](#publish). |
 | `keepAlive` | 60 seconds | The client sends PINGREQ after three quarters of a period without writes, so a full period never passes silently, and drops a connection with no PINGRESP within one period. 0 turns it off. |
 | `connectTimeout` | 10 seconds | Time allowed for the socket and CONNACK. |
 | `will` | none | `{ topic, payload, qos, retain }`, published by the broker if the client disappears without DISCONNECT. |
@@ -76,7 +76,11 @@ The first connection is not retried, so `connect` fails fast when the broker is 
 `client.publish(topic, payload, { qos, retain })` takes a string or a `Uint8Array`.
 
 - QoS 0 completes once the packet is written. While the client is reconnecting, or the socket's buffer is full, it waits.
-- QoS 1 completes on PUBACK, and QoS 2 on PUBCOMP. A message whose connection drops is sent again with DUP set after the reconnect.
+- QoS 1 completes on PUBACK, and QoS 2 on PUBCOMP.
+- When the connection drops mid-handshake, what happens after the reconnect depends on whether the broker kept the session (`sessionPresent` in CONNACK):
+  - Kept, which needs `cleanSession: false`: the message is sent again with DUP set, and the publish completes as usual.
+  - Not kept, as on every reconnect with the default `cleanSession: true`: the publish fails with `DeliveryUnknown`. The broker may already have delivered the message, and a broker without the session would deliver a resend a second time (section 3.1.2.4), so the client does not resend it. Retry only if a second delivery is safe, for example a command whose effect you can check first.
+  - A QoS 1 or 2 publish made while disconnected was never written, so it is sent for the first time after the reconnect, either way.
 - A publish interrupted before its bytes reach a socket is never sent, at any QoS, so it is safe to retry. One interrupted after that still finishes its exchange, as MQTT requires.
 
 ## Slow consumers
@@ -125,6 +129,7 @@ Every error is a tagged error, so `Effect.catchTag` can handle each one.
 | `ConnectionRefused` | The broker refused CONNECT. `returnCode` holds its reason (section 3.2.2.3). |
 | `SubscribeRejected` | The broker answered SUBSCRIBE with 0x80 for the filter. |
 | `SubscriptionStalled` | A `"backpressure"` subscription stayed full past `maxPaused`, so the client dropped it. |
+| `DeliveryUnknown` | A QoS 1 or 2 publish was cut off by a dropped connection, and the broker came back without the session, so it may or may not have been delivered. |
 | `InvalidTopic` | A topic has wildcards, or a filter misplaces `#` or `+`. |
 | `InvalidOption` | An option is out of range, such as a `bufferSize` below 1, an unknown `overflow`, or a `maxPaused` that is not positive. |
 | `MalformedPacket` | The broker sent bytes that are not valid MQTT 3.1.1. |

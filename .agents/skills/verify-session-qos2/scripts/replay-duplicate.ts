@@ -2,12 +2,14 @@
 // (it answers every CONNECT with sessionPresent = 0, as a broker does for cleanSession = true).
 //   1. you publish at QoS 2          2. the broker gets PUBLISH
 //   3. the connection drops          4. the client reconnects [the broker forgot the session]
-//   5. the broker gets PUBLISH again: a broker without the session must treat it as a new message
-// Prints how many PUBLISH packets for the one message reached a fresh broker session, and exits 1 when that is 2.
+//   5. before 0.6.0 the client resent the PUBLISH, which a broker without the session delivers again; now the publish
+//      fails with DeliveryUnknown and nothing is resent
+// Prints what happened, and exits 1 when the PUBLISH reached the broker twice or the publish did not fail.
 // Usage: bun .agents/skills/verify-session-qos2/scripts/replay-duplicate.ts
 import * as Effect from "effect/Effect"
 import * as Schedule from "effect/Schedule"
 import * as Stream from "effect/Stream"
+import * as Exit from "effect/Exit"
 import { connect } from "../../../../src/index.ts"
 import { serve } from "../../../../src/server.ts"
 
@@ -49,12 +51,17 @@ const program = Effect.gen(function* () {
     reconnect: Schedule.spaced("50 millis")
   })
 
-  yield* client.publish("printers/p1s/command", "start", { qos: 2 })
-  console.log(`publish succeeded; PUBLISH reached a fresh broker session ${publishes} times`)
+  const result = yield* Effect.exit(client.publish("printers/p1s/command", "start", { qos: 2 }))
+  const failure = Exit.isFailure(result) ? Exit.findErrorOption(result) : undefined
+  const unknown = failure !== undefined && failure._tag === "Some" && failure.value._tag === "DeliveryUnknown"
 
-  return publishes
+  // Give a resend, if any, time to arrive.
+  yield* Effect.sleep("200 millis")
+  console.log(`publish ${unknown ? "failed with DeliveryUnknown" : Exit.isSuccess(result) ? "succeeded" : "failed otherwise"}; PUBLISH reached a broker ${publishes} times`)
+
+  return publishes === 1 && unknown
 })
 
-const publishes = await Effect.runPromise(Effect.scoped(program))
+const fixed = await Effect.runPromise(Effect.scoped(program))
 
-process.exit(publishes > 1 ? 1 : 0)
+process.exit(fixed ? 0 : 1)

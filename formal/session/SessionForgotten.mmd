@@ -4,51 +4,51 @@ title: "Your QoS 2 publish across dropped connections"
 stateDiagram-v2
   direction LR
   state "Legend" as legend {
-    lg0: working
-    lg1: bad
-    lg2: Breaks YourMessageAtMostOnce
-    lg3: Path to the YourMessageAtMostOnce bug
+    lg0: good
+    lg1: working
   }
-  class lg0 blue
-  class lg1 orange
-  class lg2 breaks
-  class lg3 bugPath
+  class lg0 teal
+  class lg1 blue
   state "At the same time" as all {
     state "Your publish" as r0 {
       s0: Not published
       s1: Sent, waiting for PUBREC
+      s2: Waiting for a connection
+      s3: Given up before sending
+      s4: PUBREL sent, waiting for PUBCOMP
+      s5: Failed: delivery unknown
+      s6: Publish succeeded
       [*] --> s0
-      s0 --> s1: you publish at QoS 2
+      s0 --> s1: you publish at QoS 2 [when Connection is Connected]
+      s0 --> s2: you publish at QoS 2 [when Connection is Dropped]
+      s2 --> s3: you interrupt the publish
+      s2 --> s1: the client reconnects
+      s1 --> s4: PUBREC arrives [when Connection is Connected and Broker is Delivered once]
+      s1 --> s5: the client reconnects [the broker forgot the session]
+      s4 --> s6: PUBCOMP arrives [when Connection is Connected]
+      s4 --> s5: the client reconnects [the broker forgot the session]
     }
     --
     state "Connection" as r1 {
-      s2: Connected
-      s3: Dropped
-      [*] --> s2
-      s2 --> s3: the connection drops [when Your publish is Sent, waiting for PUBREC and Broker is Delivered once]
-      s3 --> s2: the client reconnects [the broker forgot the session]
+      s7: Connected
+      s8: Dropped
+      [*] --> s7
+      s7 --> s8: the connection drops
+      s8 --> s7: the client reconnects or the client reconnects [the broker forgot the session]
     }
     --
     state "Broker" as r2 {
-      s4: Not delivered
-      s5: Delivered once
-      s6: Delivered twice
-      [*] --> s4
-      s4 --> s5: the broker gets PUBLISH [when Your publish is Sent, waiting for PUBREC]
-      s5 --> s6: the broker gets PUBLISH [when Connection is Connected]
+      s9: Not delivered
+      s10: Delivered once
+      [*] --> s9
+      s9 --> s10: the broker gets PUBLISH [when Your publish is Sent, waiting for PUBREC and Connection is Connected]
     }
   }
-  classDef breaks fill:#ffecee,stroke:#e72e3b,stroke-width:2.5px,color:#cd2834
   class s0 blue
-  class s0 bugPath
-  class s1 bugPath
-  class s2 bugPath
+  class s1 blue
+  class s2 blue
   class s3 blue
-  class s3 bugPath
   class s4 blue
-  class s4 bugPath
   class s5 blue
-  class s5 bugPath
-  class s6 orange
-  class s6 breaks
-  class s6 bugPath
+  class s6 teal
+  class s9 blue

@@ -3,12 +3,13 @@ import type * as net from "node:net"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
+import * as Predicate from "effect/Predicate"
 import * as Schedule from "effect/Schedule"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import { describe, expect, it } from "vitest"
 import { encode } from "../src/codec.ts"
-import { ClientClosed, ConnectionError, ConnectionRefused, connect, ConnectionStatus, InvalidOption, InvalidTopic, SubscribeRejected, SubscriptionStalled } from "../src/index.ts"
+import { ClientClosed, ConnectionError, ConnectionRefused, connect, DeliveryUnknown, ConnectionStatus, InvalidOption, InvalidTopic, SubscribeRejected, SubscriptionStalled } from "../src/index.ts"
 import type { Message, Overflow } from "../src/index.ts"
 import * as P from "../src/packet.ts"
 import { aedes, closedPort, scripted, selfSigned } from "./brokers.ts"
@@ -145,13 +146,16 @@ describe("connect", () => {
       })
     ))
 
-  it("finishes a QoS 1 publish that was cut off by a dropped connection", () =>
+  it("finishes a QoS 1 publish that was cut off by a dropped connection when the broker kept the session", () =>
     run(
       Effect.gen(function* () {
         const { port, drop } = yield* aedes()
         const observer = yield* connect({ host, port })
         const messages = yield* observer.subscribe("jobs", { qos: 1 })
-        const client = yield* connect({ host, port, reconnect: Schedule.spaced("20 millis") })
+        const client = yield* connect({ host, port, cleanSession: false, reconnect: Schedule.spaced("20 millis") })
+
+        // aedes reports sessionPresent only for a stored session that has a subscription.
+        yield* client.subscribe("jobs/done", { qos: 1 })
 
         drop(client.clientId)
         yield* client.publish("jobs", "print", { qos: 1 })
@@ -159,6 +163,36 @@ describe("connect", () => {
         const [first] = yield* messages.pipe(Stream.take(1), Stream.runCollect)
 
         expect(first && summary(first)).toEqual(["jobs", "print", 1, false])
+      })
+    ))
+
+  // formal/session/SessionForgotten.cfg: the broker gets PUBLISH, the connection drops before PUBREC, and the broker
+  // comes back without the session. Resending would deliver the message a second time.
+  it.each([1, 2] as const)("fails a written QoS %i publish with DeliveryUnknown, without resending it, when the broker lost the session", (qos) =>
+    run(
+      Effect.gen(function* () {
+        const publishes: Array<number> = []
+
+        const { port } = yield* scripted((packet, socket) => {
+          if (!Predicate.isTagged(packet, "Publish")) return
+
+          publishes.push(packet.qos)
+
+          // Only the first connection sees a PUBLISH; it drops before acknowledging. Every CONNACK says sessionPresent 0.
+          socket.destroy()
+        })
+
+        const client = yield* connect({ host, port, reconnect: Schedule.spaced("20 millis") })
+        const back = yield* Effect.forkChild(reconnected(client.statusChanges), { startImmediately: true })
+        const error = yield* Effect.flip(client.publish("printers/p1s/command", "start", { qos }))
+
+        yield* Fiber.join(back)
+        // A resend would have reached the broker by the time a QoS 0 publish sent after the reconnect does.
+        yield* client.publish("printers/p1s/command", "after")
+        yield* Effect.sleep("50 millis")
+
+        expect(error).toBeInstanceOf(DeliveryUnknown)
+        expect(publishes).toEqual([qos, 0])
       })
     ))
 
