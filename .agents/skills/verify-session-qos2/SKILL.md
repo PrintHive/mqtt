@@ -14,7 +14,7 @@ gives each broken rule as its shortest path in plain words and draws the chart.
 
 The model describes this code at the sync commit.
 
-Sync commit: `65aca313e38cb15aef7603e5b8952613117895cb`
+Sync commit: `37c839a1340f83ae90c7f0181728b5d57c0a11e0`
 
 | File | Functions and lines at the sync commit | Model action |
 | --- | --- | --- |
@@ -32,7 +32,7 @@ The broker actions follow MQTT 3.1.1 section 4.3.3, not code in this repo.
 1. See what covered code changed since the sync commit, including uncommitted edits:
 
    ```sh
-   git diff --stat 65aca313e38cb15aef7603e5b8952613117895cb -- src/session.ts src/client.ts
+   git diff --stat 37c839a1340f83ae90c7f0181728b5d57c0a11e0 -- src/session.ts src/client.ts
    ```
 
    If nothing changed, go to step 3.
