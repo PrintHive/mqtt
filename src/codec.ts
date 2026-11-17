@@ -1,16 +1,15 @@
 import { Buffer } from "node:buffer"
 import * as Data from "effect/Data"
 import type { Connect, Packet, QoS, Subscription, SubackCode } from "./packet.ts"
+import { MAX_REMAINING_LENGTH, packetSize, remainingLength, varintSize } from "./varint.verify.ts"
+
+export { MAX_REMAINING_LENGTH }
 
 export class MalformedPacket extends Data.TaggedError("MalformedPacket")<{ readonly reason: string }> {}
 
 const malformed = (reason: string) => new MalformedPacket({ reason })
 
-/** The largest remaining length a 4-byte variable byte integer can hold. */
-export const MAX_REMAINING_LENGTH = 268_435_455
 const MAX_STRING_BYTES = 65_535
-
-const varintSize = (n: number): number => (n < 128 ? 1 : n < 16_384 ? 2 : n < 2_097_152 ? 3 : 4)
 
 const stringSize = (s: string): number => {
   const n = Buffer.byteLength(s)
@@ -413,6 +412,8 @@ export class Decoder {
     while (offset < chunk.length) {
       const size = packetSize(chunk, offset)
 
+      if (size < 0) throw malformed("remaining length longer than 4 bytes")
+
       if (size === 0 || offset + size > chunk.length) {
         this.needed = size
         break
@@ -432,37 +433,4 @@ export class Decoder {
       this.buffered = chunk.length - offset
     }
   }
-}
-
-/** Remaining length of the packet at `offset`. Only called once `packetSize` has read a complete header. */
-const remainingLength = (buf: Buffer, offset: number): number => {
-  let n = 0
-  let scale = 1
-
-  for (let i = offset + 1; ; i++) {
-    const b = buf[i] ?? 0
-    n += (b & 127) * scale
-
-    if (b < 128) return n
-    scale *= 128
-  }
-}
-
-/** Total size of the packet at `offset`, or 0 when its fixed header has not fully arrived. */
-const packetSize = (buf: Buffer, offset: number): number => {
-  let n = 0
-  let scale = 1
-
-  for (let i = 1; i <= 4; i++) {
-    const at = offset + i
-
-    if (at >= buf.length) return 0
-    const b = buf[at] ?? 0
-    n += (b & 127) * scale
-
-    if (b < 128) return 1 + i + n
-    scale *= 128
-  }
-
-  throw malformed("remaining length longer than 4 bytes")
 }

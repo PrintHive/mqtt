@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import { Decoder, encode, MalformedPacket } from "../src/codec.ts"
 import * as P from "../src/packet.ts"
 import type { Packet } from "../src/packet.ts"
+import { encodeVarint } from "../src/varint.verify.ts"
 
 const bytes = (hex: string) => Buffer.from(hex.replace(/\s+/g, ""), "hex")
 
@@ -61,6 +62,18 @@ describe("encode", () => {
 
   it("encodes a remaining length of 321 as the two bytes C1 02 from the spec", () => {
     expect(encode(P.publishAtMostOnce("t", new Uint8Array(318), false)).subarray(0, 3)).toEqual(bytes("30 c1 02"))
+  })
+
+  // encodeVarint is the proved encoder (src/varint.verify.dfy); the packet writer must produce the same bytes.
+  it("writes each remaining length as the proved encoder does, at every size boundary", () => {
+    for (const remaining of [3, 127, 128, 16_383, 16_384, 2_097_151, 2_097_152]) {
+      const header = encodeVarint(remaining)
+      // A QoS 0 PUBLISH to "t" has 3 bytes of topic before its payload.
+      const packet = encode(P.publishAtMostOnce("t", new Uint8Array(remaining - 3), false))
+
+      expect(packet.subarray(1, 1 + header.length)).toEqual(Buffer.from(header))
+      expect(packet.length).toBe(1 + header.length + remaining)
+    }
   })
 
   it("refuses a topic longer than 65535 bytes", () => {

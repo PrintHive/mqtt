@@ -73,6 +73,7 @@
     "@types/node": "^26",
     "aedes": "^1.2.0",
     "effect": "4.0.2",
+    "lemmascript": "0.6.10",
     "mqtt": "^5.16.1",
     "oxlint": "1.90.0",
     "typescript": "^7",

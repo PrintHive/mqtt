@@ -1,0 +1,3 @@
+[submodule "vendor/lemmascript-skills"]
+	path = vendor/lemmascript-skills
+	url = https://github.com/midspiral/lemmascript-skills.git

@@ -47,3 +47,27 @@ jobs:
       - run: bun run build
       - name: Import the built package
         run: node -e "import('./dist/index.js').then((m) => { if (typeof m.connect !== 'function') process.exit(1) })"
+
+  # Proofs in src/*.verify.dfy, listed in LemmaScript-files.txt. See .agents/skills/verify-varint/SKILL.md.
+  proofs:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    env:
+      DAFNY_VERSION: 4.11.0
+      DAFNY_SHA256: a46a9ff7cdd720f7955854c78e95df13f4cfe6b80691b05f8654fe19e8267179
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - name: Install Dafny
+        run: |
+          curl -fsSL -o dafny.zip "https://github.com/dafny-lang/dafny/releases/download/v${DAFNY_VERSION}/dafny-${DAFNY_VERSION}-x64-ubuntu-22.04.zip"
+          echo "${DAFNY_SHA256}  dafny.zip" | sha256sum -c -
+          unzip -q dafny.zip -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/dafny" >> "$GITHUB_PATH"
+      - run: dafny --version
+      # Regenerates each .dfy.gen from its .verify.ts, checks the proof .dfy only adds to it, and verifies.
+      - run: bunx lsc check --backend=dafny
+      - name: Check the committed generated Dafny is current
+        run: git diff --exit-code -- '*.dfy.gen'
